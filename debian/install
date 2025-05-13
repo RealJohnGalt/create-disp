@@ -1,1 +1,1 @@
-build/create-disp usr/bin
+obj-*/create-disp usr/bin
