@@ -1,0 +1,11 @@
+Source: create-disp
+Section: utils
+Priority: optional
+Maintainer: luka177 <lukapanio@gmail.com>
+Build-Depends: debhelper-compat (= 13), cmake, g++, libdrm-dev, libhybris-dev
+Standards-Version: 4.6.2
+
+Package: create-disp
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends} libhybris
+Description: A tool to interface lindroid-drm with hwc2
