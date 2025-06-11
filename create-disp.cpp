@@ -23,6 +23,9 @@
 #define DRM_EVDI_GET_BUFF_CALLBACK 0x08
 #define DRM_EVDI_DESTROY_BUFF_CALLBACK 0x09
 #define DRM_EVDI_SWAP_CALLBACK 0x0A
+#define DRM_EVDI_GBM_DEL_BUFF 0x0B
+#define DRM_EVDI_GBM_CREATE_BUFF 0x0C
+#define DRM_EVDI_GBM_CREATE_BUFF_CALLBACK 0x0D
 
 #define DRM_IOCTL_EVDI_CONNECT DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_CONNECT, struct drm_evdi_connect)
@@ -46,6 +49,8 @@
         DRM_EVDI_DESTROY_BUFF_CALLBACK, struct drm_evdi_destroy_buff_callback)
 #define DRM_IOCTL_EVDI_SWAP_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_SWAP_CALLBACK, struct drm_evdi_swap_callback)
+#define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
+	DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
 
 
 struct HandleInfo {
@@ -65,7 +70,8 @@ enum poll_event_type {
     add_buf,
     get_buf,
     destroy_buf,
-    swap_to
+    swap_to,
+    create_buf
 };
 
 struct drm_evdi_request_update {
@@ -111,6 +117,20 @@ struct drm_evdi_swap_callback {
 struct drm_evdi_gbm_get_buff {
         int id;
         void *native_handle;
+};
+
+struct drm_evdi_gbm_create_buff {
+	int *id;
+	uint32_t *stride;
+	uint32_t format;
+	uint32_t width;
+	uint32_t height;
+};
+
+struct drm_evdi_create_buff_callabck {
+	int poll_id;
+	int id;
+	uint32_t stride;
 };
 
 int add_handle(const native_handle_t& handle) {
@@ -288,9 +308,11 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
 void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     int id;
     memcpy(&id, data, sizeof(int));
+    printf("get_buf_from_map id: %d\n", id);
+
     buffer_handle_t handle = get_handle(id);
     struct drm_evdi_get_buff_callabck cmd = {.poll_id = poll_id, .version = handle->version, .numFds = handle->numFds, .numInts = handle->numInts, .fd_ints = const_cast<int *>(&handle->data[0]), .data_ints = const_cast<int *>(&handle->data[handle->numFds])};
-    printf("get_buf_from_map id: %d, version: %d\n", id, handle->version);
+//    printf("get_buf_from_map id: %d, version: %d\n", id, handle->version);
     ioctl(drm_fd, DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
 }
 
@@ -307,7 +329,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
                 printf("Failed to find buf: %d\n", id);
                 goto done;
         } 
-printf("Got native_handle_t, version: %d numFds: %d numInts: %d\n", in_handle->version, in_handle->numFds, in_handle->numInts);
+printf("swapping to:  native_handle_t, version: %d numFds: %d numInts: %d\n", in_handle->version, in_handle->numFds, in_handle->numInts);
     printf("data:");
     for(int i=0; i<in_handle->numFds + in_handle->numInts; i++) {
         printf(" %d ", in_handle->data[i]);
@@ -339,15 +361,31 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         int id = *(int *)data;
         int ret;
         native_handle *handle = get_handle(id);
-  //      printf("Going to release buff: %d handle: %d\n", id, handle);
+        printf("Going to release buff: %d handle: %d\n", id, handle);
         if(handle) {
                 native_handle_close(handle);
         }
         handles_map.erase(id);
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
-        ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
+        ret=ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
 }
 
+
+void create_buff(void *data, int poll_id, int drm_fd) {
+//printf("Hi from create_buff\n");
+    struct drm_evdi_gbm_create_buff buff_params;
+    struct drm_evdi_create_buff_callabck cmd;
+    memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
+    const native_handle_t *full_handle;
+    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &full_handle, &cmd.stride);
+    if (ret != 0) {
+        fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
+    }
+    cmd.id = add_handle(*full_handle);
+    cmd.poll_id = poll_id;
+printf("Hi from create_buff id: %d, stride: %d\n", cmd.id, cmd.stride);
+    ioctl(drm_fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
+}
 
 int main() {
     const std::string device_path = "/dev/dri/card1";
@@ -410,6 +448,7 @@ buffer_handle_t handle = NULL;
         ret = ioctl(fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
         if(ret)
             continue;
+	printf("Got event: %d\n", poll_cmd.event);
         switch(poll_cmd.event) {
            case add_buf:
                add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, fd);
@@ -422,6 +461,9 @@ buffer_handle_t handle = NULL;
                break;
            case destroy_buf:
                destroy_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+               break;
+	   case create_buf:
+               create_buff(poll_cmd.data, poll_cmd.poll_id, fd);
                break;
         }
     }
