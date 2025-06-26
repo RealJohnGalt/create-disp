@@ -240,7 +240,6 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     native_handle_t handle;
     int id = -1;
     memcpy(&fd, data, sizeof(int));
-    printf("Going to read from fd: %d\n", fd);
     if (fcntl(fd, F_GETFD) == -1) {
         printf("Invalid or closed file descriptor: %d\n", fd);
         return;
@@ -257,7 +256,6 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     int version = header[0];
     int numFds = header[1];
     int numInts = header[2];
-    printf("Got native_handle_t, version: %d numFds: %d numInts: %d\n", version, numFds, numInts);
 
     if (lseek(fd, 0, SEEK_SET) == -1) {
         printf("Failed to seek fd: %d\n", fd);
@@ -271,18 +269,10 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
         printf("malloc failed size: %d\n", total_size);
         return;
     }
-    printf("Going to read %d bytes\n", total_size);
     if(read(fd, full_handle, total_size) != total_size) {
         printf("Fd1 read failed fd: %d\n", fd);
         return;
     }
-
-    printf("Got native_handle_t, version: %d numFds: %d numInts: %d\n", full_handle->version, full_handle->numFds, full_handle->numInts);
-    printf("data:");
-    for(int i=0; i<full_handle->numFds + full_handle->numInts; i++) {
-        printf(" %d ", full_handle->data[i]);
-    }
-    printf("\n");
 
     for (const auto& [existing_id, existing_handle] : handles_map) {
         if (existing_handle->version == header[0] &&
@@ -299,7 +289,6 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
         id = add_handle(*full_handle);
     }
 
-    printf("Got fd: %d\n", id);
     close(fd);  
     struct drm_evdi_add_buff_callabck cmd = {.poll_id=poll_id, .buff_id=id};
     ioctl(drm_fd, DRM_IOCTL_EVDI_ADD_BUFF_CALLBACK, &cmd);
@@ -309,7 +298,6 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     int id;
     struct drm_evdi_get_buff_callabck cmd;
     memcpy(&id, data, sizeof(int));
-    printf("get_buf_from_map id: %d\n", id);
 
     buffer_handle_t handle = get_handle(id);
     if(!handle) {
@@ -334,31 +322,23 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
                 printf("Failed to find buf: %d\n", id);
                 goto done;
         } 
-printf("swapping to:  native_handle_t, version: %d numFds: %d numInts: %d\n", in_handle->version, in_handle->numFds, in_handle->numInts);
-    printf("data:");
-    for(int i=0; i<in_handle->numFds + in_handle->numInts; i++) {
-        printf(" %d ", in_handle->data[i]);
-    }
-printf("\n");
 
-uint32_t  stride;
+	uint32_t  stride;
 
         buf = new RemoteWindowBuffer(global_width, global_height, global_stride, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
-hwc2_error_t error;
+	hwc2_error_t error;
         hwc2_compat_display_set_client_target(hwcDisplay, /* slot */0, buf,
                                               -1,
                                               HAL_DATASPACE_UNKNOWN);
 
         int presentFence;
         error =hwc2_compat_display_present(hwcDisplay, &presentFence);
-    if (error != HWC2_ERROR_NONE) {
-        std::cerr << "Failed to present display: " << error << std::endl;
-    } else {
-//        std::cout << "Displayed red screen successfully!" << std::endl;
-    }
+	if (error != HWC2_ERROR_NONE) {
+		std::cerr << "Failed to present display: " << error << std::endl;
+	}
 done:
-    struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-    ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+	struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
+	ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
@@ -366,7 +346,6 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         int id = *(int *)data;
         int ret;
         native_handle *handle = get_handle(id);
-        printf("Going to release buff: %d handle: %d\n", id, handle);
         if(handle) {
                 native_handle_close(handle);
         }
@@ -388,7 +367,6 @@ void create_buff(void *data, int poll_id, int drm_fd) {
     }
     cmd.id = add_handle(*full_handle);
     cmd.poll_id = poll_id;
-printf("Hi from create_buff id: %d, stride: %d\n", cmd.id, cmd.stride);
     ioctl(drm_fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 }
 
