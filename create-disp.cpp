@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
 #include <cstring>
@@ -8,6 +9,9 @@
 #include <memory>
 #include <cassert>
 #include <unordered_map>
+#include <vector>
+#include <fstream>
+
 #include <hybris/hwc2/hwc2_compatibility_layer.h>
 #include <hybris/gralloc/gralloc.h>
 #include <hybris/platforms/common/windowbuffer.h>
@@ -165,26 +169,75 @@ static bool drm_is_master(int fd) {
     return drm_auth_magic(fd, 0) != -EACCES;
 }
 
-int evdi_open(const std::string& device_path) {
-    int fd = open(device_path.c_str(), O_RDWR);
-    if (fd < 0) {
-        perror("Failed to open device");
-        return -1;
+bool is_evdi_lindroid(int fd) {
+    drmVersionPtr version = drmGetVersion(fd);
+    if (version) {
+        std::string driver_name(version->name, version->name_len);
+        drmFreeVersion(version);
+        return (driver_name == "evdi-lindroid");
     }
+    return false;
+}
 
-    if (drm_is_master(fd)) {
-        std::cerr << "Process has master on " << device_path << ", err: " << strerror(errno) << std::endl;
-        if (ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
-            std::cerr << "Drop master on " << device_path << " failed, err: " << strerror(errno) << std::endl;
-            close(fd);
-            return -1;
+int find_evdi_lindroid_device() {
+    const std::string dri_path = "/dev/dri/";
+    std::vector<std::string> candidates;
+
+    if (DIR* dir = opendir(dri_path.c_str())) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strncmp(entry->d_name, "card", 4) == 0) {
+                candidates.emplace_back(dri_path + entry->d_name);
+            }
         }
+        closedir(dir);
     }
 
-    if (drm_is_master(fd)) {
-        std::cerr << "Drop master on " << device_path << " failed, err: " << strerror(errno) << std::endl;
+    for (const auto& path : candidates) {
+        int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+
+        if (is_evdi_lindroid(fd)) {
+            std::cout << "Found evdi-lindroid at " << path << std::endl;
+
+            if (drmIsMaster(fd)) {
+                if (ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
+                    std::cerr << "Failed to drop master on " << path << ": " << strerror(errno) << std::endl;
+                    close(fd);
+                    return -1;
+                }
+            }
+
+            return fd;
+        }
+
         close(fd);
+    }
+
+    return -1;
+}
+
+int open_evdi_lindroid_or_create() {
+    int fd = find_evdi_lindroid_device();
+    if (fd >= 0) {
+        return fd;
+    }
+
+    //try to create device
+    std::cout << "evdi-lindroid not found. Attempting to create..." << std::endl;
+    std::ofstream evdi_add("/sys/devices/evdi-lindroid/add");
+    if (!evdi_add) {
+        std::cerr << "Failed to write to /sys/devices/evdi-lindroid/add: " << strerror(errno) << std::endl;
         return -1;
+    }
+
+    evdi_add << "1";
+    evdi_add.close();
+
+    sleep(1);
+    fd = find_evdi_lindroid_device();
+    if (fd < 0) {
+        std::cerr << "evdi-lindroid still not available after add attempt." << std::endl;
     }
 
     return fd;
@@ -371,48 +424,47 @@ void create_buff(void *data, int poll_id, int drm_fd) {
 }
 
 int main() {
-    const std::string device_path = "/dev/dri/card1";
     int device_index = 0;
     int composerSequenceId = 0;
     int ret =0;
 
-   hwcDevice = hwc2_compat_device_new(false);
-        assert(hwcDevice);
+    hwcDevice = hwc2_compat_device_new(false);
+    assert(hwcDevice);
 
-        hwc2_compat_device_register_callback(hwcDevice, &eventListener,
-                                             composerSequenceId);
+    hwc2_compat_device_register_callback(hwcDevice, &eventListener,
+                                         composerSequenceId);
 
-        for (int i = 0; i < 5 * 1000; ++i) {
-                /* Wait at most 5s for hotplug events */
-                if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
-                        break;
-                usleep(1000);
-        }
-        assert(hwcDisplay);
+    for (int i = 0; i < 5 * 1000; ++i) {
+            /* Wait at most 5s for hotplug events */
+            if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
+                    break;
+            usleep(1000);
+    }
+    assert(hwcDisplay);
 
-        hwc2_compat_display_set_power_mode(hwcDisplay, HWC2_POWER_MODE_ON);
+    hwc2_compat_display_set_power_mode(hwcDisplay, HWC2_POWER_MODE_ON);
 
-        HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
+    HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
 
-        printf("width: %i height: %i\n", config->width, config->height);
+    printf("width: %i height: %i\n", config->width, config->height);
     global_width = config->width;
     global_height = config->height;
-buffer_handle_t handle = NULL;
+    buffer_handle_t handle = NULL;
 
     ret = hybris_gralloc_allocate(global_width, global_height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &handle, &global_stride);
 
-        layer = hwc2_compat_display_create_layer(hwcDisplay);
+    layer = hwc2_compat_display_create_layer(hwcDisplay);
 
-        hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
-        hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
-        hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, config->width,
-                                          config->height);
-        hwc2_compat_layer_set_display_frame(layer, 0, 0, config->width,
-                                            config->height);
-        hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
-                                             config->height);
+    hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
+    hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
+    hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, config->width,
+                                      config->height);
+    hwc2_compat_layer_set_display_frame(layer, 0, 0, config->width,
+                                        config->height);
+    hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
+                                         config->height);
 
-    int fd = evdi_open(device_path);
+    int fd = open_evdi_lindroid_or_create();
     if (fd < 0) {
         return EXIT_FAILURE;
     }
