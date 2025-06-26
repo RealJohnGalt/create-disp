@@ -307,11 +307,16 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
 
 void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     int id;
+    struct drm_evdi_get_buff_callabck cmd;
     memcpy(&id, data, sizeof(int));
     printf("get_buf_from_map id: %d\n", id);
 
     buffer_handle_t handle = get_handle(id);
-    struct drm_evdi_get_buff_callabck cmd = {.poll_id = poll_id, .version = handle->version, .numFds = handle->numFds, .numInts = handle->numInts, .fd_ints = const_cast<int *>(&handle->data[0]), .data_ints = const_cast<int *>(&handle->data[handle->numFds])};
+    if(!handle) {
+        cmd = {.poll_id = poll_id, .version = -1, .numFds = -1, .numInts = -1, .fd_ints = nullptr, .data_ints = nullptr};
+    } else {
+        cmd = {.poll_id = poll_id, .version = handle->version, .numFds = handle->numFds, .numInts = handle->numInts, .fd_ints = const_cast<int *>(&handle->data[0]), .data_ints = const_cast<int *>(&handle->data[handle->numFds])};
+    }
 //    printf("get_buf_from_map id: %d, version: %d\n", id, handle->version);
     ioctl(drm_fd, DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
 }
