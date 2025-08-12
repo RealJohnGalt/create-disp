@@ -1,3 +1,5 @@
+#include <chrono>
+#include <thread>
 #include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
@@ -61,6 +63,27 @@ struct HandleInfo {
     std::unique_ptr<native_handle_t> handle;
     int id;
 };
+
+constexpr int max_retries = 5;
+constexpr int retry_delay_ms = 10;
+
+static int retry_ioctl(int fd, unsigned long request, void* arg) {
+    for (int attempt = 1; attempt <= max_retries; ++attempt) {
+        int ret = ioctl(fd, request, arg);
+        if (ret == 0) return 0;
+        if (errno == EFAULT) {
+            if (attempt == max_retries) {
+                std::cerr << "ioctl 0x" << std::hex << request
+                          << " failed with EFAULT after " << max_retries << " attempts\n";
+                return -EFAULT;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms));
+            continue;
+        }
+        return -errno;
+    }
+    return -EFAULT;
+}
 
 hwc2_compat_display_t* hwcDisplay;
 hwc2_compat_device_t* hwcDevice;
@@ -159,7 +182,7 @@ native_handle_t* get_handle(int id) {
 static int drm_auth_magic(int fd, drm_magic_t magic) {
     drm_auth_t auth{};
     auth.magic = magic;
-    if (ioctl(fd, DRM_IOCTL_AUTH_MAGIC, &auth)) {
+    if (retry_ioctl(fd, DRM_IOCTL_AUTH_MAGIC, &auth)) {
         return -errno;
     }
     return 0;
@@ -201,7 +224,7 @@ int find_evdi_lindroid_device() {
             std::cout << "Found evdi-lindroid at " << path << std::endl;
 
             if (drmIsMaster(fd)) {
-                if (ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
+                if (retry_ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
                     std::cerr << "Failed to drop master on " << path << ": " << strerror(errno) << std::endl;
                     close(fd);
                     return -1;
@@ -252,7 +275,7 @@ int evdi_connect(int fd, int device_index, uint32_t width, uint32_t height, uint
         .refresh_rate = refresh_rate,
     };
 
-    if (ioctl(fd, DRM_IOCTL_EVDI_CONNECT, &cmd) < 0) {
+    if (retry_ioctl(fd, DRM_IOCTL_EVDI_CONNECT, &cmd) < 0) {
         perror("DRM_IOCTL_EVDI_CONNECT failed");
         return -1;
     }
@@ -344,7 +367,7 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
 
     close(fd);  
     struct drm_evdi_add_buff_callabck cmd = {.poll_id=poll_id, .buff_id=id};
-    ioctl(drm_fd, DRM_IOCTL_EVDI_ADD_BUFF_CALLBACK, &cmd);
+    retry_ioctl(drm_fd, DRM_IOCTL_EVDI_ADD_BUFF_CALLBACK, &cmd);
 }
 
 void get_buf_from_map(void *data, int poll_id, int drm_fd) {
@@ -359,7 +382,7 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
         cmd = {.poll_id = poll_id, .version = handle->version, .numFds = handle->numFds, .numInts = handle->numInts, .fd_ints = const_cast<int *>(&handle->data[0]), .data_ints = const_cast<int *>(&handle->data[handle->numFds])};
     }
 //    printf("get_buf_from_map id: %d, version: %d\n", id, handle->version);
-    ioctl(drm_fd, DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
+    retry_ioctl(drm_fd, DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
@@ -391,7 +414,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 	}
 done:
 	struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-	ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+	retry_ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
@@ -404,7 +427,7 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         }
         handles_map.erase(id);
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
-        ret=ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
+        ret = retry_ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
 }
 
 
@@ -420,7 +443,7 @@ void create_buff(void *data, int poll_id, int drm_fd) {
     }
     cmd.id = add_handle(*full_handle);
     cmd.poll_id = poll_id;
-    ioctl(drm_fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
+    retry_ioctl(drm_fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 }
 
 int main() {
@@ -480,7 +503,7 @@ int main() {
     poll_cmd.data = malloc(1024);
 
     while (true) {
-        ret = ioctl(fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
+        ret = retry_ioctl(fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
         if(ret)
             continue;
 	printf("Got event: %d\n", poll_cmd.event);
