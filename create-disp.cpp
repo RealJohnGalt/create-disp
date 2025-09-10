@@ -234,13 +234,18 @@ int open_evdi_lindroid_or_create() {
     evdi_add << "1";
     evdi_add.close();
 
-    sleep(2);
-    fd = find_evdi_lindroid_device();
-    if (fd < 0) {
-        std::cerr << "evdi-lindroid still not available after add attempt." << std::endl;
+    int wait_interval = 1; // interval between evdi device check
+    int total_wait_limit = 30; // total wait time limit for evdi device check
+    for (int wait_time = 0; wait_time < total_wait_limit; wait_time += wait_interval) {
+        fd = find_evdi_lindroid_device();
+        if (fd > 0) {
+            return fd;
+        }
+        sleep(wait_interval);
     }
 
-    return fd;
+    std::cerr << "evdi-lindroid still not available after add attempt." << std::endl;
+    return -1;
 }
 
 int evdi_connect(int fd, int device_index, uint32_t width, uint32_t height, uint32_t refresh_rate) {
