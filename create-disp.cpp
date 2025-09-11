@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <vector>
 #include <fstream>
+#include <cmath>
+#include <climits>
 
 #include <hybris/hwc2/hwc2_compatibility_layer.h>
 #include <hybris/gralloc/gralloc.h>
@@ -428,6 +430,19 @@ void create_buff(void *data, int poll_id, int drm_fd) {
     ioctl(drm_fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 }
 
+static inline int hz_from_period_ns(int32_t ns)
+{
+    if (ns <= 0) return 60;
+    const double hz_f = 1e9 / static_cast<double>(ns);
+    int hz = static_cast<int>(std::lround(hz_f));
+    return hz;
+}
+
+static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg)
+{
+    return hz_from_period_ns(cfg->vsyncPeriod);
+}
+
 int main() {
     int device_index = 0;
     int composerSequenceId = 0;
@@ -474,12 +489,16 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    if (evdi_connect(fd, device_index, config->width, config->height, 60) < 0) {
+    int refresh_hz = get_refresh_hz_from_active_config(config);
+
+    if (evdi_connect(fd, device_index, config->width, config->height, refresh_hz) < 0) {
         close(fd);
         return EXIT_FAILURE;
     }
 
-    std::cout << "EDID for 1080p60Hz 'Lindroid display' written successfully." << std::endl;
+    std::cout << "EDID for " << config->width << "x" << config->height
+              << "@" << refresh_hz << "Hz 'Lindroid display' written successfully."
+              << std::endl;
 
     drm_evdi_poll poll_cmd;
     poll_cmd.data = malloc(1024);
