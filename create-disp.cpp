@@ -240,7 +240,7 @@ int open_evdi_lindroid_or_create() {
     int total_wait_limit = 30; // total wait time limit for evdi device check
     for (int wait_time = 0; wait_time < total_wait_limit; wait_time += wait_interval) {
         fd = find_evdi_lindroid_device();
-        if (fd > 0) {
+        if (fd >= 0) {
             return fd;
         }
         sleep(wait_interval);
