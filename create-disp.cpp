@@ -3,10 +3,13 @@
 #include <iostream>
 #include <cstring>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <cerrno>
 #include <xf86drm.h>
 #include <memory>
+#include <sys/prctl.h>
+#include <inttypes.h>
 #include <cassert>
 #include <unordered_map>
 #include <vector>
@@ -79,6 +82,9 @@ enum poll_event_type {
     swap_to,
     create_buf
 };
+
+static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_fd = -1;
 
 struct drm_evdi_request_update {
     int32_t reserved;
@@ -248,6 +254,24 @@ int open_evdi_lindroid_or_create() {
 
     std::cerr << "evdi-lindroid still not available after add attempt." << std::endl;
     return -1;
+}
+
+static void handle_stop_and_close(int) {
+    g_stop = 1;
+    int fd = g_fd;
+    if (fd >= 0) { g_fd = -1; close(fd); }
+}
+
+static void init_sig_handlers(void) {
+    struct sigaction sa{};
+    sa.sa_handler = handle_stop_and_close;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+    // Worst case: kernel can deliver SIGTERM
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
 }
 
 int evdi_connect(int fd, int device_index, uint32_t width, uint32_t height, uint32_t refresh_rate) {
@@ -446,7 +470,9 @@ static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg
 int main() {
     int device_index = 0;
     int composerSequenceId = 0;
-    int ret =0;
+    int ret = 0;
+
+    init_sig_handlers();
 
     hwcDevice = hwc2_compat_device_new(false);
     assert(hwcDevice);
@@ -484,15 +510,17 @@ int main() {
     hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
                                          config->height);
 
-    int fd = open_evdi_lindroid_or_create();
-    if (fd < 0) {
+    int fd_local = open_evdi_lindroid_or_create();
+    if (fd_local < 0) {
         return EXIT_FAILURE;
     }
+    g_fd = fd_local;
 
     int refresh_hz = get_refresh_hz_from_active_config(config);
 
-    if (evdi_connect(fd, device_index, config->width, config->height, refresh_hz) < 0) {
-        close(fd);
+    if (evdi_connect(fd_local, device_index, config->width, config->height, refresh_hz) < 0) {
+        close(fd_local);
+        g_fd = -1;
         return EXIT_FAILURE;
     }
 
@@ -503,31 +531,36 @@ int main() {
     drm_evdi_poll poll_cmd;
     poll_cmd.data = malloc(1024);
 
-    while (true) {
-        ret = ioctl(fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
-        if(ret)
+    while (!g_stop) {
+        ret = ioctl(fd_local, DRM_IOCTL_EVDI_POLL, &poll_cmd);
+        if (ret < 0) {
+		g_stop = 1;
+                break;
+
             continue;
+        }
 	printf("Got event: %d\n", poll_cmd.event);
         switch(poll_cmd.event) {
            case add_buf:
-               add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, fd);
+               add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, fd_local);
                break;
            case get_buf:
-               get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, fd);
+               get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, fd_local);
                break;
            case swap_to:
-               swap_to_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+               swap_to_buff(poll_cmd.data, poll_cmd.poll_id, fd_local);
                break;
            case destroy_buf:
-               destroy_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+               destroy_buff(poll_cmd.data, poll_cmd.poll_id, fd_local);
                break;
 	   case create_buf:
-               create_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+               create_buff(poll_cmd.data, poll_cmd.poll_id, fd_local);
                break;
         }
     }
 
     free(poll_cmd.data);
-    close(fd);
+    if (fd_local >= 0) close(fd_local);
+    g_fd = -1;
     return EXIT_SUCCESS;
 }
