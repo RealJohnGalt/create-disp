@@ -5,6 +5,7 @@ After=sysinit.target
 [Service]
 Restart=always
 RestartSec=1
+User=lindroid
 ExecStart=/usr/bin/create-disp
 
 [Install]
