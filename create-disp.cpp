@@ -23,6 +23,14 @@
 #include <hybris/gralloc/gralloc.h>
 #include <hybris/platforms/common/windowbuffer.h>
 
+struct drm_evdi_poll_vec {
+	uint64_t entries_ptr;
+	uint32_t entry_size;
+	uint32_t capacity;
+	uint32_t count;
+	uint32_t reserved;
+};
+
 #define DRM_EVDI_CONNECT          0x00
 #define DRM_EVDI_REQUEST_UPDATE   0x01
 #define DRM_EVDI_GRABPIX          0x02
@@ -37,6 +45,7 @@
 #define DRM_EVDI_GBM_DEL_BUFF 0x0B
 #define DRM_EVDI_GBM_CREATE_BUFF 0x0C
 #define DRM_EVDI_GBM_CREATE_BUFF_CALLBACK 0x0D
+#define DRM_EVDI_POLL_VEC 0x0E
 
 #define DRM_IOCTL_EVDI_CONNECT DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_CONNECT, struct drm_evdi_connect)
@@ -62,6 +71,8 @@
         DRM_EVDI_SWAP_CALLBACK, struct drm_evdi_swap_callback)
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
 	DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
+#define DRM_IOCTL_EVDI_POLL_VEC DRM_IOWR(DRM_COMMAND_BASE + \
+	DRM_EVDI_POLL_VEC, struct drm_evdi_poll_vec)
 
 
 struct HandleInfo {
@@ -543,28 +554,88 @@ int main() {
     poll_cmd.data = malloc(1024);
 
     while (true) {
+        const uint32_t cap = 16;
+        struct drm_evdi_poll_vec vec;
+        uint32_t batch_i = 0, batch_n = 0;
+        bool in_batch = false;
+        int ret_vec = -1;
+        void* saved_data = poll_cmd.data;
+        struct drm_evdi_poll* entries = (struct drm_evdi_poll*)malloc(sizeof(struct drm_evdi_poll) * cap);
+        if (!entries) {
+            usleep(1000); continue;
+        }
+        void* payload_block = malloc(1024 * cap);
+        if (!payload_block) {
+            free(entries); usleep(1000); continue;
+        }
+
+        memset(&vec, 0, sizeof(vec));
+        memset(entries, 0, sizeof(*entries) * cap);
+        vec.entries_ptr = (uint64_t)(uintptr_t)entries;
+        vec.entry_size = sizeof(struct drm_evdi_poll);
+        vec.capacity = cap;
+        for (uint32_t i = 0; i < cap; ++i)
+            entries[i].data = (char*)payload_block + (size_t)i * 1024;
+
+	errno = 0;
+        ret_vec = ioctl(fd, DRM_IOCTL_EVDI_POLL_VEC, &vec);
+	if (ret_vec < 0)
+		printf("EVDI vec poll: ret=%d errno=%d\n", ret_vec, errno);
+
+        if (ret_vec == 0 && vec.count > 0) {
+            printf("EVDI vec poll: count=%u\n", vec.count);
+            batch_i = 0;
+            batch_n = vec.count;
+            in_batch = true;
+            memcpy(&poll_cmd, &entries[batch_i], sizeof(poll_cmd));
+            memcpy(saved_data, entries[batch_i].data, 1024);
+            poll_cmd.data = saved_data;
+            batch_i++;
+            goto dispatch;
+        }
+        free(payload_block);
+        free(entries);
+        memset(&poll_cmd, 0, sizeof(poll_cmd));
+        poll_cmd.data = saved_data;
+
         ret = ioctl(fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
-        if(ret < 0) {
+        if (ret < 0) {
             usleep(1000);
             continue;
         }
-	printf("Got event: %d\n", poll_cmd.event);
-        switch(poll_cmd.event) {
-           case add_buf:
-               add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, fd);
-               break;
-           case get_buf:
-               get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, fd);
-               break;
-           case swap_to:
-               swap_to_buff(poll_cmd.data, poll_cmd.poll_id, fd);
-               break;
-           case destroy_buf:
-               destroy_buff(poll_cmd.data, poll_cmd.poll_id, fd);
-               break;
-	   case create_buf:
-               create_buff(poll_cmd.data, poll_cmd.poll_id, fd);
-               break;
+        goto dispatch;
+
+dispatch:
+        printf("Got event: %d\n", poll_cmd.event);
+        switch (poll_cmd.event) {
+            case add_buf:
+                add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, fd);
+                break;
+            case get_buf:
+                get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, fd);
+                break;
+            case destroy_buf:
+                destroy_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+                break;
+            case swap_to:
+                swap_to_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+                break;
+            case create_buf:
+                create_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+                break;
+            default:
+                break;
+        }
+        if (in_batch && batch_i < batch_n) {
+            memcpy(&poll_cmd, &entries[batch_i], sizeof(poll_cmd));
+            memcpy(saved_data, entries[batch_i].data, 1024);
+            poll_cmd.data = saved_data;
+            batch_i++;
+            goto dispatch;
+        }
+        if (in_batch) {
+            free(payload_block);
+            free(entries);
         }
     }
 
