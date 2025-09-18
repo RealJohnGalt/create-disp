@@ -521,8 +521,10 @@ int main() {
 
     while (true) {
         ret = ioctl(fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
-        if(ret)
+        if(ret < 0) {
+            usleep(1000);
             continue;
+        }
 	printf("Got event: %d\n", poll_cmd.event);
         switch(poll_cmd.event) {
            case add_buf:
