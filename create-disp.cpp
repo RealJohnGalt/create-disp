@@ -14,6 +14,7 @@
 #include <cmath>
 #include <climits>
 #include <chrono>
+#include <poll.h>
 
 #include <systemd/sd-daemon.h>
 
@@ -398,6 +399,13 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         error =hwc2_compat_display_present(hwcDisplay, &presentFence);
 	if (error != HWC2_ERROR_NONE) {
 		std::cerr << "Failed to present display: " << error << std::endl;
+	}
+	if (presentFence >= 0) {
+		struct pollfd pfd;
+		pfd.fd = presentFence;
+		pfd.events = POLLIN;
+		(void)poll(&pfd, 1, -1);
+		close(presentFence);
 	}
 done:
 	struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
