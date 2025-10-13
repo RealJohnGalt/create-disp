@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
+#include <inttypes.h>
 #include <cstring>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -14,6 +15,10 @@
 #include <cmath>
 #include <climits>
 #include <chrono>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
 #include <systemd/sd-daemon.h>
 
@@ -59,35 +64,8 @@
 #define DRM_IOCTL_EVDI_SWAP_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_SWAP_CALLBACK, struct drm_evdi_swap_callback)
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
-	DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
+DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
 
-
-struct HandleInfo {
-    std::unique_ptr<native_handle_t> handle;
-    int id;
-};
-
-int drm_fd;
-hwc2_compat_display_t* hwcDisplay;
-hwc2_compat_device_t* hwcDevice;
-static std::unordered_map<int, std::unique_ptr<RemoteWindowBuffer>> buffers_map;
-static std::unordered_map<int, std::unique_ptr<native_handle_t>> handles_map;
-static std::unordered_map<std::string, int> handle_index;
-static inline std::string make_handle_key(const native_handle_t* h) {
-	const int total_ints = h->numInts;
-	const size_t key_bytes = (3 + total_ints) * sizeof(int);
-	std::string key(key_bytes, '\0');
-	size_t off = 0;
-	memcpy(&key[off], &h->version, sizeof(int)); off += sizeof(int);
-	memcpy(&key[off], &h->numFds, sizeof(int));  off += sizeof(int);
-	memcpy(&key[off], &h->numInts, sizeof(int)); off += sizeof(int);
-	memcpy(&key[off], &h->data[h->numFds], total_ints * sizeof(int));
-	return key;
-}
-int global_width, global_height;
-uint32_t global_stride;
-int next_id = 0;
-hwc2_compat_layer_t* layer;
 enum poll_event_type {
     none,
     add_buf,
@@ -102,11 +80,11 @@ struct drm_evdi_request_update {
 };
 
 struct drm_evdi_connect {
-        int32_t connected;
-        int32_t dev_index;
-        uint32_t width;
-        uint32_t height;
-        uint32_t refresh_rate;
+    int32_t connected;
+    int32_t dev_index;
+    uint32_t width;
+    uint32_t height;
+    uint32_t refresh_rate;
 };
 
 struct drm_evdi_poll {
@@ -116,89 +94,129 @@ struct drm_evdi_poll {
 };
 
 struct drm_evdi_add_buff_callabck {
-        int poll_id;
-        int buff_id;
+    int poll_id;
+    int buff_id;
 };
 
 struct drm_evdi_get_buff_callabck {
-        int poll_id;
-        int version;
-        int numFds;
-        int numInts;
-        int *fd_ints;
-        int *data_ints;
+    int poll_id;
+    int version;
+    int numFds;
+    int numInts;
+    int *fd_ints;
+    int *data_ints;
 };
 
 struct drm_evdi_destroy_buff_callback {
-        int poll_id;
+    int poll_id;
 };
 
 struct drm_evdi_swap_callback {
-        int poll_id;
+    int poll_id;
 };
 
 struct drm_evdi_gbm_get_buff {
-        int id;
-        void *native_handle;
+    int id;
+    void *native_handle;
 };
 
 struct drm_evdi_gbm_create_buff {
-	int *id;
-	uint32_t *stride;
-	uint32_t format;
-	uint32_t width;
-	uint32_t height;
+    int *id;
+    uint32_t *stride;
+    uint32_t format;
+    uint32_t width;
+    uint32_t height;
 };
 
 struct drm_evdi_create_buff_callabck {
-	int poll_id;
-	int id;
-	uint32_t stride;
+    int poll_id;
+    int id;
+    uint32_t stride;
 };
 
-int add_handle(const native_handle_t& handle) {
-    size_t total_size = sizeof(native_handle_t) + (handle.numFds + handle.numInts) * sizeof(int);
-    native_handle_t* copied_handle = (native_handle_t*)malloc(total_size);
-    if (!copied_handle) {
-        printf("Memory allocation failed for handle copy\n");
-        return -1;
-    }
-    memcpy(copied_handle, &handle, total_size);
+class DisplayPipeline {
+public:
+    /* HWC2 */
+    hwc2_display_t display_id{0};
+    hwc2_compat_display_t* hwc_display{nullptr};
+    hwc2_compat_layer_t* layer{nullptr};
 
-    int id = next_id++;
-    handles_map[id] = std::unique_ptr<native_handle_t>(copied_handle);
-    return id;
+    /* DRM/evdi */
+    int drm_fd{-1};
+    int device_index{0};
+
+    /* Geometry */
+    std::atomic<uint32_t> width{0};
+    std::atomic<uint32_t> height{0};
+    uint32_t stride{0};
+
+    /* Buffer state */
+    mutable std::mutex maps_mutex;
+    std::unordered_map<int, std::unique_ptr<RemoteWindowBuffer>> buffers_map;
+    std::unordered_map<int, std::unique_ptr<native_handle_t>> handles_map;
+    std::unordered_map<std::string, int> handle_index;
+    std::atomic<int> next_id{0};
+
+    /* Reconfig */
+    std::atomic<bool> reconfig_in_progress{false};
+    std::atomic<bool> active{false};
+    std::thread poll_thread;
+    std::atomic<bool> stop_poll{false};
+
+    DisplayPipeline() = default;
+    ~DisplayPipeline() { cleanup(); }
+
+    bool initialize(hwc2_display_t id, hwc2_compat_display_t* hwc_disp, int dev_idx);
+    void cleanup();
+    bool update_geometry();
+    void clear_buffers();
+    void poll_loop();
+
+    /* Buffer management */
+    int add_handle(const native_handle_t& handle);
+    native_handle_t* get_handle(int id);
+
+    /* Handle event processing */
+    void handle_add_buf(void* data, int poll_id);
+    void handle_get_buf(void* data, int poll_id);
+    void handle_swap_to(void* data, int poll_id);
+    void handle_destroy_buf(void* data, int poll_id);
+    void handle_create_buf(void* data, int poll_id);
+
+private:
+    std::string make_handle_key(const native_handle_t* h);
+    bool ensure_layer_configured();
+    int open_evdi_device(int dev_idx);
+};
+
+/* Global state */
+static hwc2_compat_device_t* g_hwc_device = nullptr;
+static std::unordered_map<hwc2_display_t, std::unique_ptr<DisplayPipeline>> g_pipelines;
+static std::mutex g_pipelines_mutex;
+static std::atomic<bool> g_shutdown{false};
+static std::atomic<int> g_next_device_index{0};
+static std::condition_variable g_pipe_cv;
+static std::mutex g_pipe_cv_mtx;
+
+static bool create_display_pipeline(hwc2_display_t display_id, bool connected);
+static void destroy_display_pipeline(hwc2_display_t display_id);
+static int hz_from_period_ns(int32_t ns);
+static int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg);
+
+std::string DisplayPipeline::make_handle_key(const native_handle_t* h) {
+    const int total_ints = h->numInts;
+    const size_t key_bytes = (3 + total_ints) * sizeof(int);
+    std::string key(key_bytes, '\0');
+    size_t off = 0;
+    memcpy(&key[off], &h->version, sizeof(int)); off += sizeof(int);
+    memcpy(&key[off], &h->numFds, sizeof(int));  off += sizeof(int);
+    memcpy(&key[off], &h->numInts, sizeof(int)); off += sizeof(int);
+    memcpy(&key[off], &h->data[h->numFds], total_ints * sizeof(int));
+    return key;
 }
 
-native_handle_t* get_handle(int id) {
-    auto it = handles_map.find(id);
-    return (it != handles_map.end()) ? it->second.get() : nullptr;
-}
-
-static int drm_auth_magic(int fd, drm_magic_t magic) {
-    drm_auth_t auth{};
-    auth.magic = magic;
-    if (ioctl(fd, DRM_IOCTL_AUTH_MAGIC, &auth)) {
-        return -errno;
-    }
-    return 0;
-}
-
-static bool drm_is_master(int fd) {
-    return drm_auth_magic(fd, 0) != -EACCES;
-}
-
-bool is_evdi_lindroid(int fd) {
-    drmVersionPtr version = drmGetVersion(fd);
-    if (version) {
-        std::string driver_name(version->name, version->name_len);
-        drmFreeVersion(version);
-        return (driver_name == "evdi-lindroid");
-    }
-    return false;
-}
-
-int find_evdi_lindroid_device() {
+int DisplayPipeline::open_evdi_device(int dev_idx) {
+    // Try to find existing evdi-lindroid device
     const std::string dri_path = "/dev/dri/";
     std::vector<std::string> candidates;
 
@@ -212,369 +230,508 @@ int find_evdi_lindroid_device() {
         closedir(dir);
     }
 
+    // Try existing cards first
     for (const auto& path : candidates) {
         int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
         if (fd < 0) continue;
 
-        if (is_evdi_lindroid(fd)) {
-            std::cout << "Found evdi-lindroid at " << path << std::endl;
-
-            if (drmIsMaster(fd)) {
-                if (ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
-                    std::cerr << "Failed to drop master on " << path << ": " << strerror(errno) << std::endl;
-                    close(fd);
-                    return -1;
+        drmVersionPtr version = drmGetVersion(fd);
+        if (version) {
+            std::string driver_name(version->name, version->name_len);
+            drmFreeVersion(version);
+            if (driver_name == "evdi-lindroid") {
+                if (drmIsMaster(fd)) {
+                    if (ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
+                        close(fd);
+                        continue;
+                    }
                 }
+                return fd;
             }
-
-            return fd;
         }
-
         close(fd);
     }
 
-    return -1;
-}
-
-int open_evdi_lindroid_or_create() {
-    int fd = find_evdi_lindroid_device();
-    if (fd >= 0) {
-        return fd;
-    }
-
-    //try to create device
-    std::cout << "evdi-lindroid not found. Attempting to create..." << std::endl;
+    // Create new device if needed
     std::ofstream evdi_add("/sys/devices/evdi-lindroid/add");
-    if (!evdi_add) {
-        std::cerr << "Failed to write to /sys/devices/evdi-lindroid/add: " << strerror(errno) << std::endl;
-        return -1;
-    }
-
+    if (!evdi_add) return -1;
     evdi_add << "1";
     evdi_add.close();
 
-    int wait_interval = 1; // interval between evdi device check
-    int total_wait_limit = 30; // total wait time limit for evdi device check
-    for (int wait_time = 0; wait_time < total_wait_limit; wait_time += wait_interval) {
-        fd = find_evdi_lindroid_device();
-        if (fd >= 0) {
-            return fd;
+    // Wait for device to appear
+    for (int i = 0; i < 30; ++i) {
+        sleep(1);
+        if (DIR* dir = opendir(dri_path.c_str())) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                if (strncmp(entry->d_name, "card", 4) == 0) {
+                    std::string path = dri_path + entry->d_name;
+                    int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+                    if (fd < 0) continue;
+
+                    drmVersionPtr version = drmGetVersion(fd);
+                    if (version) {
+                        std::string driver_name(version->name, version->name_len);
+                        drmFreeVersion(version);
+                        if (driver_name == "evdi-lindroid") {
+                            closedir(dir);
+                            return fd;
+                        }
+                    }
+                    close(fd);
+                }
+            }
+            closedir(dir);
         }
-        sleep(wait_interval);
     }
 
-    std::cerr << "evdi-lindroid still not available after add attempt." << std::endl;
     return -1;
 }
 
-int evdi_connect(int fd, int device_index, uint32_t width, uint32_t height, uint32_t refresh_rate) {
-    drm_evdi_connect cmd = {
-        .connected = 1,
-        .dev_index = device_index,
-        .width = width,
-        .height = height,
-        .refresh_rate = refresh_rate,
-    };
+static inline bool pipeline_exists_unlocked(hwc2_display_t id)
+{
+    return g_pipelines.find(id) != g_pipelines.end();
+}
 
-    if (ioctl(fd, DRM_IOCTL_EVDI_CONNECT, &cmd) < 0) {
-        perror("DRM_IOCTL_EVDI_CONNECT failed");
-        return -1;
+bool DisplayPipeline::initialize(hwc2_display_t id, hwc2_compat_display_t* hwc_disp, int dev_idx) {
+    display_id = id;
+    hwc_display = hwc_disp;
+    device_index = dev_idx;
+
+    drm_fd = open_evdi_device(dev_idx);
+    if (drm_fd < 0) return false;
+
+    hwc2_compat_display_set_power_mode(hwc_display, HWC2_POWER_MODE_ON);
+
+    if (!update_geometry()) {
+        close(drm_fd);
+        drm_fd = -1;
+        return false;
     }
 
-    return 0;
+    active = true;
+    stop_poll = false;
+    poll_thread = std::thread(&DisplayPipeline::poll_loop, this);
+
+    return true;
 }
 
-int update_display();
-
-void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
-                     hwc2_display_t display, int64_t timestamp)
+void DisplayPipeline::poll_loop()
 {
+    while (!stop_poll.load(std::memory_order_relaxed)) {
+        struct drm_evdi_poll poll_cmd;
+        poll_cmd.data = malloc(1024);
+        int ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
+        if (ret == 0) {
+            switch (poll_cmd.event) {
+                case add_buf:		handle_add_buf(poll_cmd.data, poll_cmd.poll_id); break;
+                case get_buf:		handle_get_buf(poll_cmd.data, poll_cmd.poll_id); break;
+                case swap_to:		handle_swap_to(poll_cmd.data, poll_cmd.poll_id); break;
+                case destroy_buf:	handle_destroy_buf(poll_cmd.data, poll_cmd.poll_id); break;
+                case create_buf:	handle_create_buf(poll_cmd.data, poll_cmd.poll_id); break;
+                default: break;
+            }
+        }
+        free(poll_cmd.data);
+    }
 }
 
-void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
-                       hwc2_display_t display, bool connected,
-                       bool primaryDisplay)
-{
-        printf("onHotplugReceived(%d, %" PRIu64 ", %s, %s)\n",
-                sequenceId, display,
-                connected ? "connected" : "disconnected",
-                primaryDisplay ? "primary" : "external");
 
-        hwc2_compat_device_on_hotplug(hwcDevice, display, connected);
+void DisplayPipeline::cleanup() {
+    active = false;
+    stop_poll = true;
+    if (poll_thread.joinable())
+        poll_thread.join();
+
+    if (drm_fd >= 0) {
+        close(drm_fd);
+        drm_fd = -1;
+    }
+    clear_buffers();
 }
 
-void onRefreshReceived(HWC2EventListener* listener,
-                       int32_t sequenceId, hwc2_display_t display)
-{
-    printf("onRefreshReceived\n");
-    if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
-        update_display();
+bool DisplayPipeline::ensure_layer_configured() {
+    if (!layer && hwc_display) {
+        layer = hwc2_compat_display_create_layer(hwc_display);
+        if (!layer) return false;
+
+        hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
+        hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
+    }
+
+    if (layer) {
+        uint32_t w = width.load();
+        uint32_t h = height.load();
+        hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, (float)w, (float)h);
+        hwc2_compat_layer_set_display_frame(layer, 0, 0, (int32_t)w, (int32_t)h);
+        hwc2_compat_layer_set_visible_region(layer, 0, 0, (int32_t)w, (int32_t)h);
+    }
+
+    return layer != nullptr;
 }
 
-HWC2EventListener eventListener = {
-    &onVsyncReceived,
-    &onHotplugReceived,
-    &onRefreshReceived
-};
+bool DisplayPipeline::update_geometry() {
+    if (!hwc_display) return false;
 
-void add_buf_to_map(void *data, int poll_id, int drm_fd) {
+    // Prevent concurrent geometry updates
+    bool expected = false;
+    if (!reconfig_in_progress.compare_exchange_strong(expected, true)) {
+        return true;
+    }
+
+    HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwc_display);
+    if (!config) {
+        reconfig_in_progress = false;
+        return false;
+    }
+
+    uint32_t new_width = (uint32_t)config->width;
+    uint32_t new_height = (uint32_t)config->height;
+
+    bool geometry_changed = (width.load() != new_width || height.load() != new_height);
+
+    if (geometry_changed) {
+        width = new_width;
+        height = new_height;
+
+        if (!ensure_layer_configured()) {
+            reconfig_in_progress = false;
+            return false;
+        }
+
+        // Reconnect evdi with new geometry
+        int refresh_hz = get_refresh_hz_from_active_config(config);
+        drm_evdi_connect cmd = {
+            .connected = 1,
+            .dev_index = device_index,
+            .width = new_width,
+            .height = new_height,
+            .refresh_rate = (uint32_t)refresh_hz,
+        };
+
+        if (ioctl(drm_fd, DRM_IOCTL_EVDI_CONNECT, &cmd) < 0) {
+            reconfig_in_progress = false;
+            return false;
+        }
+
+        clear_buffers();
+
+        std::cout << "Display " << display_id << " reconfigured to " 
+                  << new_width << "x" << new_height << "@" << refresh_hz << "Hz" << std::endl;
+    }
+
+    reconfig_in_progress = false;
+    return true;
+}
+
+void DisplayPipeline::clear_buffers() {
+    std::lock_guard<std::mutex> lock(maps_mutex);
+    buffers_map.clear();
+    handles_map.clear();
+    handle_index.clear();
+}
+
+int DisplayPipeline::add_handle(const native_handle_t& handle) {
+    std::lock_guard<std::mutex> lock(maps_mutex);
+
+    size_t total_size = sizeof(native_handle_t) + (handle.numFds + handle.numInts) * sizeof(int);
+    native_handle_t* copied_handle = (native_handle_t*)malloc(total_size);
+    if (!copied_handle) return -1;
+
+    memcpy(copied_handle, &handle, total_size);
+
+    int id = next_id.fetch_add(1);
+    handles_map[id] = std::unique_ptr<native_handle_t>(copied_handle);
+    return id;
+}
+
+native_handle_t* DisplayPipeline::get_handle(int id) {
+    std::lock_guard<std::mutex> lock(maps_mutex);
+    auto it = handles_map.find(id);
+    return (it != handles_map.end()) ? it->second.get() : nullptr;
+}
+
+void DisplayPipeline::handle_add_buf(void* data, int poll_id) {
     int fd;
-    native_handle_t handle;
-    int id = -1;
     memcpy(&fd, data, sizeof(int));
-    if (fcntl(fd, F_GETFD) == -1) {
-        printf("Invalid or closed file descriptor: %d\n", fd);
-        return;
-    }
-    if (lseek(fd, 0, SEEK_SET) == -1) {
-        printf("Failed to seek fd: %d\n", fd);
-        return;
-    }
+
+    if (fcntl(fd, F_GETFD) == -1) return;
+    if (lseek(fd, 0, SEEK_SET) == -1) return;
+
     int header[3];
-    if (read(fd, header, sizeof(header)) != sizeof(header)) {
-        printf("Fd1 read failed fd: %d\n", fd);
-        return;
-    }
+    if (read(fd, header, sizeof(header)) != sizeof(header)) return;
+
     int version = header[0];
     int numFds = header[1];
     int numInts = header[2];
 
-    if (lseek(fd, 0, SEEK_SET) == -1) {
-        printf("Failed to seek fd: %d\n", fd);
-        return;
-    }
-    // Allocate memory for the full handle, including FDs and ints
-    size_t total_size = sizeof(buffer_handle_t) + 
-                        ((numFds + numInts) * sizeof(int));
-    native_handle_t *full_handle = (native_handle_t*)malloc(total_size);
-    if (!full_handle) {
-        printf("malloc failed size: %d\n", total_size);
-        return;
-    }
-    if(read(fd, full_handle, total_size) != total_size) {
-        printf("Fd1 read failed fd: %d\n", fd);
+    if (lseek(fd, 0, SEEK_SET) == -1) return;
+
+    size_t total_size = sizeof(native_handle_t) + ((numFds + numInts) * sizeof(int));
+    native_handle_t* full_handle = (native_handle_t*)malloc(total_size);
+    if (!full_handle) return;
+
+    if (read(fd, full_handle, total_size) != total_size) {
+        free(full_handle);
         return;
     }
 
+    int id = -1;
     {
+        std::lock_guard<std::mutex> lock(maps_mutex);
         const std::string key = make_handle_key(full_handle);
         auto it = handle_index.find(key);
         if (it != handle_index.end()) {
-            printf("Identical buffer found, returning existing id: %d\n", it->second);
             id = it->second;
             free(full_handle);
-        }
-        if (id == -1) {
+        } else {
             id = add_handle(*full_handle);
             handle_index.emplace(key, id);
             free(full_handle);
         }
     }
 
-    close(fd);  
-    struct drm_evdi_add_buff_callabck cmd = {.poll_id=poll_id, .buff_id=id};
+    close(fd);
+
+    struct drm_evdi_add_buff_callabck cmd = {.poll_id = poll_id, .buff_id = id};
     ioctl(drm_fd, DRM_IOCTL_EVDI_ADD_BUFF_CALLBACK, &cmd);
 }
 
-void get_buf_from_map(void *data, int poll_id, int drm_fd) {
+void DisplayPipeline::handle_get_buf(void* data, int poll_id) {
     int id;
-    struct drm_evdi_get_buff_callabck cmd;
     memcpy(&id, data, sizeof(int));
 
-    buffer_handle_t handle = get_handle(id);
-    if(!handle) {
-        cmd = {.poll_id = poll_id, .version = -1, .numFds = -1, .numInts = -1, .fd_ints = nullptr, .data_ints = nullptr};
+    native_handle_t* handle = get_handle(id);
+    struct drm_evdi_get_buff_callabck cmd;
+
+    if (!handle) {
+        cmd = {.poll_id = poll_id, .version = -1, .numFds = -1, .numInts = -1, 
+               .fd_ints = nullptr, .data_ints = nullptr};
     } else {
-        cmd = {.poll_id = poll_id, .version = handle->version, .numFds = handle->numFds, .numInts = handle->numInts, .fd_ints = const_cast<int *>(&handle->data[0]), .data_ints = const_cast<int *>(&handle->data[handle->numFds])};
+        cmd = {.poll_id = poll_id, .version = handle->version, .numFds = handle->numFds, 
+               .numInts = handle->numInts, 
+               .fd_ints = const_cast<int*>(&handle->data[0]), 
+               .data_ints = const_cast<int*>(&handle->data[handle->numFds])};
     }
-//    printf("get_buf_from_map id: %d, version: %d\n", id, handle->version);
+
     ioctl(drm_fd, DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
 }
 
-void swap_to_buff(void *data, int poll_id, int drm_fd) {
-        const native_handle_t* out_handle = NULL;
-        int id;
-        int ret;
-        memcpy(&id, data, sizeof(int));
+void DisplayPipeline::handle_swap_to(void* data, int poll_id) {
+    int id;
+    memcpy(&id, data, sizeof(int));
 
-        buffer_handle_t in_handle = get_handle(id);
-        RemoteWindowBuffer *buf;
+    auto send_swap_cb = [this, poll_id]() {
+        struct drm_evdi_swap_callback cmd = {.poll_id = poll_id};
+        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+    };
 
-        if(in_handle == nullptr) {
-                printf("Failed to find buf: %d\n", id);
-                goto done;
-        } 
+    native_handle_t* in_handle = get_handle(id);
+    if (!in_handle) { send_swap_cb(); return; }
 
-	{
-	auto it_buf = buffers_map.find(id);
-	if (it_buf == buffers_map.end()) {
-		auto new_buf = std::make_unique<RemoteWindowBuffer>(
-			global_width, global_height, global_stride,
-			HAL_PIXEL_FORMAT_RGBA_8888,
-			GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
-		buf = new_buf.get();
-		buffers_map[id] = std::move(new_buf);
-	} else { buf = it_buf->second.get(); }
-	}
-	hwc2_error_t error;
-    if(buf->width > global_width, buf->height > global_height)
-        goto done;
-        hwc2_compat_display_set_client_target(hwcDisplay, /* slot */0, buf,
-                                              -1,
-                                              HAL_DATASPACE_UNKNOWN);
+    uint32_t curr_width = width.load();
+    uint32_t curr_height = height.load();
+    RemoteWindowBuffer* buf = nullptr;
 
-        int presentFence;
-        error =hwc2_compat_display_present(hwcDisplay, &presentFence);
-	if (error != HWC2_ERROR_NONE) {
-		std::cerr << "Failed to present display: " << error << std::endl;
-	}
-done:
-	struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-	ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
-}
-
-void destroy_buff(void *data, int poll_id, int drm_fd) {
-        const native_handle_t* out_handle = NULL;
-        int id = *(int *)data;
-        int ret;
-        native_handle *handle = get_handle(id);
-        if(handle) {
-                native_handle_close(handle);
+    {
+        std::lock_guard<std::mutex> lock(maps_mutex);
+        auto it = buffers_map.find(id);
+        if (it == buffers_map.end()) {
+            auto new_buf = std::make_unique<RemoteWindowBuffer>(
+                curr_width, curr_height, stride,
+                HAL_PIXEL_FORMAT_RGBA_8888,
+                GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER,
+                in_handle);
+            buf = new_buf.get();
+            buffers_map[id] = std::move(new_buf);
+        } else {
+            buf = it->second.get();
         }
-	buffers_map.erase(id);
-        handles_map.erase(id);
-        struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
-        ret=ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
+    }
+
+    if (buf->width != curr_width || buf->height != curr_height) {
+        send_swap_cb();
+        return;
+    }
+
+    if (hwc_display) {
+        hwc2_compat_display_set_client_target(hwc_display, 0, buf, -1, HAL_DATASPACE_UNKNOWN);
+        int presentFence;
+        (void)hwc2_compat_display_present(hwc_display, &presentFence);
+    }
+
+    send_swap_cb();
 }
 
+void DisplayPipeline::handle_destroy_buf(void* data, int poll_id) {
+    int id = *(int*)data;
 
-void create_buff(void *data, int poll_id, int drm_fd) {
-//printf("Hi from create_buff\n");
-    struct drm_evdi_gbm_create_buff buff_params;
-    struct drm_evdi_create_buff_callabck cmd;
-    memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
-    const native_handle_t *full_handle;
-    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &full_handle, &cmd.stride);
-    if (ret != 0) {
-        fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
+    {
+        std::lock_guard<std::mutex> lock(maps_mutex);
+        auto handle_it = handles_map.find(id);
+        if (handle_it != handles_map.end()) {
+            native_handle_close(handle_it->second.get());
+            handles_map.erase(handle_it);
+        }
+        buffers_map.erase(id);
     }
-    cmd.id = add_handle(*full_handle);
+
+    struct drm_evdi_destroy_buff_callback cmd = {.poll_id = poll_id};
+    ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
+}
+
+void DisplayPipeline::handle_create_buf(void* data, int poll_id) {
+    struct drm_evdi_gbm_create_buff buff_params;
+    memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
+
+    const native_handle_t* full_handle;
+    uint32_t stride_out;
+    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, 
+                                     HAL_PIXEL_FORMAT_RGBA_8888,
+                                     GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, 
+                                     &full_handle, &stride_out);
+
+    struct drm_evdi_create_buff_callabck cmd;
+    if (ret == 0) {
+        cmd.id = add_handle(*full_handle);
+        cmd.stride = stride_out;
+    } else {
+        cmd.id = -1;
+        cmd.stride = 0;
+    }
     cmd.poll_id = poll_id;
+
     ioctl(drm_fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 }
 
-static inline int hz_from_period_ns(int32_t ns)
-{
+static int hz_from_period_ns(int32_t ns) {
     if (ns <= 0) return 60;
     const double hz_f = 1e9 / static_cast<double>(ns);
-    int hz = static_cast<int>(std::lround(hz_f));
-    return hz;
+    return static_cast<int>(std::lround(hz_f));
 }
 
-static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg)
-{
+static int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg) {
     return hz_from_period_ns(cfg->vsyncPeriod);
 }
 
-int update_display() {
-     HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
+static bool create_display_pipeline(hwc2_display_t display_id, bool connected) {
+    if (!connected) {
+        destroy_display_pipeline(display_id);
+        return true;
+    }
 
-    printf("width: %i height: %i\n", config->width, config->height);
-    if(global_width != config->width || global_height != config->height) {
-        global_width = config->width;
-        global_height = config->height;
-        buffer_handle_t handle = NULL;
-
-        hybris_gralloc_allocate(global_width, global_height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &handle, &global_stride);
-
-        layer = hwc2_compat_display_create_layer(hwcDisplay);
-
-        hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
-        hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
-        hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, config->width,
-                                        config->height);
-        hwc2_compat_layer_set_display_frame(layer, 0, 0, config->width,
-                                            config->height);
-        hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
-                                            config->height);
-
-        int refresh_hz = get_refresh_hz_from_active_config(config);
-
-        std::cout << "EDID for " << config->width << "x" << config->height
-             << "@" << refresh_hz << "Hz 'Lindroid display' written successfully."
-             << std::endl;
-
-        if (evdi_connect(drm_fd, 0, config->width, config->height, refresh_hz) < 0) {
-            return EXIT_FAILURE;
+    {
+        std::lock_guard<std::mutex> lock(g_pipelines_mutex);
+        if (pipeline_exists_unlocked(display_id)) {
+            return true;
         }
     }
-    return 0;
+
+    hwc2_compat_display_t* hwc_disp = hwc2_compat_device_get_display_by_id(g_hwc_device, display_id);
+    if (!hwc_disp) return false;
+
+    auto pipeline = std::make_unique<DisplayPipeline>();
+    int dev_idx = g_next_device_index.fetch_add(1);
+
+    if (!pipeline->initialize(display_id, hwc_disp, dev_idx)) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_pipelines_mutex);
+        g_pipelines[display_id] = std::move(pipeline);
+        g_pipe_cv.notify_all();
+    }
+
+    std::cout << "Created pipeline for display " << display_id << std::endl;
+    return true;
 }
 
-int main() {
-    int device_index = 0;
-    int composerSequenceId = 0;
-    int ret =0;
+static void destroy_display_pipeline(hwc2_display_t display_id) {
+    std::unique_ptr<DisplayPipeline> pipeline;
 
+    {
+        std::lock_guard<std::mutex> lock(g_pipelines_mutex);
+        auto it = g_pipelines.find(display_id);
+        if (it != g_pipelines.end()) {
+            pipeline = std::move(it->second);
+            g_pipelines.erase(it);
+            g_pipe_cv.notify_all();
+        }
+    }
+
+    if (pipeline) {
+        pipeline->cleanup();
+        std::cout << "Destroyed pipeline for display " << display_id << std::endl;
+    }
+}
+
+void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
+                     hwc2_display_t display, int64_t timestamp) {
+}
+
+void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
+                       hwc2_display_t display, bool connected, bool primaryDisplay) {
+    std::cout << "Hotplug: display " << display << (connected ? " connected" : " disconnected") 
+              << (primaryDisplay ? " (primary)" : " (external)") << std::endl;
+
+    hwc2_compat_device_on_hotplug(g_hwc_device, display, connected);
+    create_display_pipeline(display, connected);
+}
+
+void onRefreshReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_display_t display) {
+    std::lock_guard<std::mutex> lock(g_pipelines_mutex);
+    auto it = g_pipelines.find(display);
+    if (it != g_pipelines.end() && it->second) {
+        it->second->update_geometry();
+    }
+}
+
+static HWC2EventListener g_event_listener = {
+    &onVsyncReceived,
+    &onHotplugReceived,
+    &onRefreshReceived
+};
+
+int main() {
     sd_notifyf(0, "MAINPID=%lu", (unsigned long)getpid());
     sd_notify(0, "STATUS=Initializing create-disp…");
-    hwcDevice = hwc2_compat_device_new(false);
-    assert(hwcDevice);
 
-    hwc2_compat_device_register_callback(hwcDevice, &eventListener,
-                                         composerSequenceId);
-
-    for (int i = 0; i < 5 * 1000; ++i) {
-            /* Wait at most 5s for hotplug events */
-            if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
-                    break;
-            usleep(1000);
-    }
-    assert(hwcDisplay);
-
-    hwc2_compat_display_set_power_mode(hwcDisplay, HWC2_POWER_MODE_ON);
-
-    drm_fd = open_evdi_lindroid_or_create();
-    if (drm_fd < 0) {
+    g_hwc_device = hwc2_compat_device_new(false);
+    if (!g_hwc_device) {
+        std::cerr << "Failed to create HWC2 device" << std::endl;
         return EXIT_FAILURE;
     }
 
-    ret = update_display();
-    if(ret)
-        return ret;
+    hwc2_compat_device_register_callback(g_hwc_device, &g_event_listener, 0);
+
+    for (int i = 0; i < 5000; ++i) {
+        hwc2_compat_display_t* primary = hwc2_compat_device_get_display_by_id(g_hwc_device, 0);
+        if (primary) {
+            create_display_pipeline(0, true);
+            break;
+        }
+        usleep(1000);
+    }
 
     sd_notify(0, "READY=1");
     sd_notify(0, "STATUS=create-disp ready.");
 
-    drm_evdi_poll poll_cmd;
-    poll_cmd.data = malloc(1024);
+    std::unique_lock<std::mutex> lk(g_pipe_cv_mtx);
+    g_pipe_cv.wait(lk, []{
+        return false;
+    });
 
-    while (true) {
-        ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
-        if(ret)
-            continue;
-	printf("Got event: %d\n", poll_cmd.event);
-        switch(poll_cmd.event) {
-           case add_buf:
-               add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-           case get_buf:
-               get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-           case swap_to:
-               swap_to_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-           case destroy_buf:
-               destroy_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-	   case create_buf:
-               create_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
+    g_shutdown = true;
+
+    {
+        std::lock_guard<std::mutex> lock(g_pipelines_mutex);
+        for (auto& kv : g_pipelines) {
+            kv.second->cleanup();
         }
+        g_pipelines.clear();
     }
 
-    free(poll_cmd.data);
-    close(drm_fd);
     sd_notify(0, "STATUS=Shutting down…");
     return EXIT_SUCCESS;
 }
