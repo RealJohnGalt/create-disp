@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
+#include <inttypes.h>
 #include <cstring>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -67,9 +68,12 @@ struct HandleInfo {
     int id;
 };
 
+static volatile int g_reconfig_in_progress = 0;
 int drm_fd;
 hwc2_compat_display_t* hwcDisplay;
 hwc2_compat_device_t* hwcDevice;
+static int device_index = 0;
+static int composerSequenceId = 0;
 static std::unordered_map<int, std::unique_ptr<RemoteWindowBuffer>> buffers_map;
 static std::unordered_map<int, std::unique_ptr<native_handle_t>> handles_map;
 static std::unordered_map<std::string, int> handle_index;
@@ -186,6 +190,13 @@ static int drm_auth_magic(int fd, drm_magic_t magic) {
 
 static bool drm_is_master(int fd) {
     return drm_auth_magic(fd, 0) != -EACCES;
+}
+
+static void clear_buffers_map()
+{
+    buffers_map.clear();
+    handles_map.clear();
+    handle_index.clear();
 }
 
 bool is_evdi_lindroid(int fd) {
@@ -306,9 +317,15 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
 void onRefreshReceived(HWC2EventListener* listener,
                        int32_t sequenceId, hwc2_display_t display)
 {
-    printf("onRefreshReceived\n");
-    if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
-        update_display();
+    hwc2_compat_display_t* d = hwc2_compat_device_get_display_by_id(hwcDevice, 0);
+    if (!d)
+        return;
+
+    hwcDisplay = d;
+    if (__sync_lock_test_and_set(&g_reconfig_in_progress, 1) == 0) {
+        (void)update_display();
+        __sync_lock_release(&g_reconfig_in_progress);
+    }
 }
 
 HWC2EventListener eventListener = {
@@ -417,7 +434,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 	} else { buf = it_buf->second.get(); }
 	}
 	hwc2_error_t error;
-    if(buf->width > global_width, buf->height > global_height)
+    if (buf->width != global_width || buf->height != global_height)
         goto done;
         hwc2_compat_display_set_client_target(hwcDisplay, /* slot */0, buf,
                                               -1,
@@ -476,45 +493,56 @@ static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg
     return hz_from_period_ns(cfg->vsyncPeriod);
 }
 
-int update_display() {
-     HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
-
-    printf("width: %i height: %i\n", config->width, config->height);
-    if(global_width != config->width || global_height != config->height) {
-        global_width = config->width;
-        global_height = config->height;
-        buffer_handle_t handle = NULL;
-
-        hybris_gralloc_allocate(global_width, global_height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &handle, &global_stride);
-
+static int ensure_layer_configured(uint32_t w, uint32_t h)
+{
+    if (!layer) {
         layer = hwc2_compat_display_create_layer(hwcDisplay);
+        if (!layer)
+            return -1;
 
         hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
         hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
-        hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, config->width,
-                                        config->height);
-        hwc2_compat_layer_set_display_frame(layer, 0, 0, config->width,
-                                            config->height);
-        hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
-                                            config->height);
-
-        int refresh_hz = get_refresh_hz_from_active_config(config);
-
-        std::cout << "EDID for " << config->width << "x" << config->height
-             << "@" << refresh_hz << "Hz 'Lindroid display' written successfully."
-             << std::endl;
-
-        if (evdi_connect(drm_fd, 0, config->width, config->height, refresh_hz) < 0) {
-            return EXIT_FAILURE;
-        }
     }
+    hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, (float)w, (float)h);
+    hwc2_compat_layer_set_display_frame(layer, 0, 0, (int32_t)w, (int32_t)h);
+    hwc2_compat_layer_set_visible_region(layer, 0, 0, (int32_t)w, (int32_t)h);
+    return 0;
+}
+
+int update_display() {
+    HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
+    if (!config)
+        return 0;
+
+    printf("active config width: %i height: %i\n", config->width, config->height);
+    if ((uint32_t)global_width == (uint32_t)config->width &&
+        (uint32_t)global_height == (uint32_t)config->height)
+        return 0;
+
+    global_width = (uint32_t)config->width;
+    global_height = (uint32_t)config->height;
+
+    if (ensure_layer_configured(global_width, global_height) != 0)
+        return EXIT_FAILURE;
+
+    int refresh_hz = get_refresh_hz_from_active_config(config);
+
+    if (evdi_connect(drm_fd, 0, (uint32_t)config->width, (uint32_t)config->height, (uint32_t)refresh_hz) < 0)
+        return EXIT_FAILURE;
+
+    clear_buffers_map();
+
+    std::cout << "EDID for " << config->width << "x" << config->height
+         << "@" << refresh_hz << "Hz 'Lindroid display' configured successfully."
+         << std::endl;
+
     return 0;
 }
 
 int main() {
-    int device_index = 0;
-    int composerSequenceId = 0;
-    int ret =0;
+    int ret = 0;
+    device_index = 0;
+    composerSequenceId = 0;
 
     sd_notifyf(0, "MAINPID=%lu", (unsigned long)getpid());
     sd_notify(0, "STATUS=Initializing create-disp…");
@@ -539,9 +567,19 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    ret = update_display();
-    if(ret)
-        return ret;
+    HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
+    if (!config) {
+        std::cerr << "No active display config" << std::endl;
+        return EXIT_FAILURE;
+    }
+    global_width = (uint32_t)config->width;
+    global_height = (uint32_t)config->height;
+    if (ensure_layer_configured(global_width, global_height) != 0)
+        return EXIT_FAILURE;
+
+    if (evdi_connect(drm_fd, device_index, (uint32_t)global_width, (uint32_t)global_height,
+                     (uint32_t)get_refresh_hz_from_active_config(config)) < 0)
+        return EXIT_FAILURE;
 
     sd_notify(0, "READY=1");
     sd_notify(0, "STATUS=create-disp ready.");
