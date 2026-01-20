@@ -19,6 +19,9 @@
 #include <climits>
 #include <cstdint>
 #include <chrono>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <linux/dma-buf.h>
 
 #include <systemd/sd-daemon.h>
 
@@ -261,6 +264,12 @@ struct drm_evdi_create_buff_callabck {
 	uint32_t stride;
 };
 
+int add_handle_owned(native_handle_t* handle) {
+    int id = next_id++;
+    handles_map[id] = std::unique_ptr<native_handle_t>(handle);
+    return id;
+}
+
 int add_handle(const native_handle_t& handle) {
     const size_t total_size = sizeof(native_handle_t) + (handle.numFds + handle.numInts) * sizeof(int);
     native_handle_t* copied_handle = (native_handle_t*)malloc(total_size);
@@ -274,6 +283,70 @@ int add_handle(const native_handle_t& handle) {
     handles_map[id] = std::unique_ptr<native_handle_t>(copied_handle);
     return id;
 }
+
+class GrallocHandlePool {
+    struct Item {
+        native_handle_t* handle;
+        uint32_t width;
+        uint32_t height;
+        uint32_t stride;
+    };
+    std::vector<Item> pool;
+
+public:
+    void release(native_handle_t* h, uint32_t w, uint32_t h_dim, uint32_t s) {
+        if (pool.size() < 128) {
+            int fd = h->data[0];
+            off_t real_size = lseek(fd, 0, SEEK_END);
+            
+            /* Zero to prevent visual artifacts */
+            if (real_size > 0) {
+                void* vaddr = mmap(NULL, (size_t)real_size, PROT_WRITE, MAP_SHARED, fd, 0);
+                if (vaddr != MAP_FAILED) {
+                    struct dma_buf_sync sync = {0};
+                    sync.flags = DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_START;
+                    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+                    
+                    memset(vaddr, 0, (size_t)real_size);
+                    
+                    sync.flags = DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END;
+                    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+                    
+                    munmap(vaddr, (size_t)real_size);
+                }
+            }
+
+            /* Rotate FDs to prevent caching issues (virtual keyboard disappearing) */
+            for (int i = 0; i < h->numFds; i++) {
+                int old_fd = h->data[i];
+                int new_fd = dup(old_fd);
+                if (new_fd >= 0) {
+                    close(old_fd);
+                    h->data[i] = new_fd;
+                }
+            }
+
+            pool.push_back({h, w, h_dim, s});
+        } else {
+            native_handle_close(h);
+            free(h);
+        }
+    }
+
+    native_handle_t* acquire(uint32_t w, uint32_t h, uint32_t* out_stride) {
+        for (size_t i = 0; i < pool.size(); ++i) {
+            if (pool[i].width == w && pool[i].height == h) {
+                native_handle_t* ret = pool[i].handle;
+                if (out_stride) *out_stride = pool[i].stride;
+                pool[i] = pool.back();
+                pool.pop_back();
+                return ret;
+            }
+        }
+        return nullptr;
+    }
+};
+static GrallocHandlePool g_gralloc_pool;
 
 native_handle_t* get_handle(int id) {
     auto it = handles_map.find(id);
@@ -654,9 +727,17 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         const native_handle_t* out_handle = NULL;
         int id = *(int *)data;
         int ret;
-        native_handle_t *handle = get_handle(id);
-        if(handle) {
-                native_handle_close(handle);
+        auto it_handle = handles_map.find(id);
+        if (it_handle != handles_map.end()) {
+            native_handle_t* h = it_handle->second.release();
+            auto it_buf = buffers_map.find(id);
+            if (it_buf != buffers_map.end() && it_buf->second) {
+                 g_gralloc_pool.release(h, it_buf->second->width, it_buf->second->height, it_buf->second->stride);
+            } else {
+                 native_handle_close(h);
+                 free(h);
+            }
+            handles_map.erase(it_handle);
         }
         auto it_hh = handle_hash_by_id.find(id);
         if (it_hh != handle_hash_by_id.end()) {
@@ -678,7 +759,6 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
                 handle_hash_by_id.erase(it_hh);
         }
 	buffers_map.erase(id);
-        handles_map.erase(id);
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
         ret=ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
 }
@@ -689,12 +769,17 @@ void create_buff(void *data, int poll_id, int drm_fd) {
     struct drm_evdi_gbm_create_buff buff_params;
     struct drm_evdi_create_buff_callabck cmd;
     memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
-    const native_handle_t *full_handle;
-    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &full_handle, &cmd.stride);
-    if (ret != 0) {
-        fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
+    native_handle_t* recycled = g_gralloc_pool.acquire(buff_params.width, buff_params.height, &cmd.stride);
+    if (recycled) {
+        cmd.id = add_handle_owned(recycled);
+    } else {
+        const native_handle_t *full_handle;
+        int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &full_handle, &cmd.stride);
+        if (ret != 0) {
+            fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
+        }
+        cmd.id = add_handle(*full_handle);
     }
-    cmd.id = add_handle(*full_handle);
     cmd.poll_id = poll_id;
     ioctl(drm_fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 }
