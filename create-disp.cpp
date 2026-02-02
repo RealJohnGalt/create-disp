@@ -1,5 +1,10 @@
 #include <dirent.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/eventfd.h>
+#include <cinttypes>
+#include <mutex>
 #include <iostream>
 #include <sstream>
 #include <cstring>
@@ -7,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <cerrno>
 #include <xf86drm.h>
+#include <array>
 #include <memory>
 #include <cassert>
 #include <unordered_map>
@@ -22,6 +28,7 @@
 #include <thread>
 #include <atomic>
 #include <csignal>
+#include <condition_variable>
 
 #include <systemd/sd-daemon.h>
 
@@ -44,6 +51,7 @@ struct drm_evdi_swap_callback;
 #define DRM_EVDI_GBM_DEL_BUFF 0x0B
 #define DRM_EVDI_GBM_CREATE_BUFF 0x0C
 #define DRM_EVDI_GBM_CREATE_BUFF_CALLBACK 0x0D
+#define DRM_EVDI_SET_ACQUIRE_FENCE 0x0E
 
 #define DRM_IOCTL_EVDI_CONNECT DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_CONNECT, struct drm_evdi_connect)
@@ -68,7 +76,9 @@ struct drm_evdi_swap_callback;
 #define DRM_IOCTL_EVDI_SWAP_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_SWAP_CALLBACK, struct drm_evdi_swap_callback)
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
-	DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
+        DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
+#define DRM_IOCTL_EVDI_SET_ACQUIRE_FENCE DRM_IOWR(DRM_COMMAND_BASE +  \
+        DRM_EVDI_SET_ACQUIRE_FENCE, struct drm_evdi_set_acquire_fence)
 
 static const int kMaxDriverDisplays = 5;
 static std::unordered_map<long long, int> g_hwc_to_drv;
@@ -153,6 +163,7 @@ struct Display {
     uint32_t stride = 0;
     hwc2_compat_display_t* hwcDisplay = nullptr;
     hwc2_compat_layer_t* layer = nullptr;
+    std::atomic<bool> seen_vsync{false};
 };
 
 static std::unordered_map<int, Display> g_displays;
@@ -167,17 +178,21 @@ static std::atomic<bool> g_running{true};
 #endif
 
 static constexpr int kRwbUsage =
-	GRALLOC_USAGE_HW_TEXTURE |
-	GRALLOC_USAGE_HW_RENDER |
-	GRALLOC_USAGE_HW_COMPOSER;
+        GRALLOC_USAGE_HW_TEXTURE |
+        GRALLOC_USAGE_HW_RENDER |
+        GRALLOC_USAGE_HW_COMPOSER;
+
+static inline int drv_id_for_hwc(long long hwc_id);
 
 static inline Display& get_or_create_display(int display_id) {
     auto it = g_displays.find(display_id);
     if (it != g_displays.end()) return it->second;
-    Display d;
+    auto res = g_displays.emplace(std::piecewise_construct,
+                                  std::forward_as_tuple(display_id),
+                                  std::forward_as_tuple());
+    Display &d = res.first->second;
     d.display_id = display_id;
-    g_displays.emplace(display_id, d);
-    return g_displays[display_id];
+    return d;
 }
 
 struct HandleInfo {
@@ -257,8 +272,21 @@ struct drm_evdi_destroy_buff_callback {
         int poll_id;
 };
 
+struct drm_evdi_swap_event {
+        int id;
+        int display_id;
+        int acquire_fence_fd;
+};
+
+struct drm_evdi_set_acquire_fence {
+        int id;
+        uint32_t display_id;
+        int acquire_fence_fd;
+};
+
 struct drm_evdi_swap_callback {
         int poll_id;
+        int release_fence_fd;
 };
 
 struct drm_evdi_gbm_get_buff {
@@ -280,10 +308,176 @@ struct drm_evdi_create_buff_callabck {
 	uint32_t stride;
 };
 
-static inline void evdi_swap_ack(int poll_id, int drm_fd)
+static inline void evdi_swap_ack(int poll_id, int drm_fd, int release_fence_fd)
 {
-	struct drm_evdi_swap_callback cmd = {.poll_id = poll_id};
-	ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        struct drm_evdi_swap_callback cmd;
+        int rc;
+
+        cmd.poll_id = poll_id;
+        cmd.release_fence_fd = release_fence_fd;
+        rc = ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        (void)rc;
+
+        if (release_fence_fd >= 0)
+                close(release_fence_fd);
+}
+
+static std::atomic<bool> g_present_inflight[kMaxDriverDisplays];
+static std::atomic<bool> g_need_present[kMaxDriverDisplays];
+
+struct pending_swap {
+    bool valid = false;
+    int id = 0;
+    int poll_id = 0;
+    int acquire_fence_fd = -1;
+};
+
+static std::thread g_present_thread;
+static int g_present_wake_efd = -1;
+static std::mutex g_present_mu[kMaxDriverDisplays];
+static pending_swap g_pending[kMaxDriverDisplays];
+
+/* Serialize HWC / display state changes vs present thread. */
+static std::mutex g_hwc_mu;
+
+static inline void present_worker_wake()
+{
+    if (g_present_wake_efd < 0)
+        return;
+    uint64_t one = 1;
+    ssize_t rc = write(g_present_wake_efd, &one, sizeof(one));
+    (void)rc;
+}
+
+native_handle_t* get_handle(int id);
+
+static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int acquire_fence_fd)
+{
+    std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
+
+    if (unlikely(drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)) {
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
+        evdi_swap_ack(poll_id, drm_fd, -1);
+        return;
+    }
+
+    buffer_handle_t in_handle = get_handle(id);
+    if (unlikely(in_handle == nullptr)) {
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
+        g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+        evdi_swap_ack(poll_id, drm_fd, -1);
+        return;
+    }
+
+    Display& D = get_or_create_display(drv_display_id);
+    if (unlikely(!D.hwcDisplay || D.width == 0 || D.height == 0)) {
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
+        g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+        evdi_swap_ack(poll_id, drm_fd, -1);
+        return;
+    }
+
+    RemoteWindowBuffer *buf = nullptr;
+    auto it_buf = buffers_map.find(id);
+    if (it_buf == buffers_map.end()) {
+        void* mem = g_rwb_pool.acquire();
+        RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
+            D.width, D.height, D.stride,
+            HAL_PIXEL_FORMAT_RGBA_8888,
+            kRwbUsage, in_handle);
+        it_buf = buffers_map.emplace(id, UniqueRwb(rb)).first;
+    }
+
+    buf = it_buf->second.get();
+    if (unlikely(buf->width != D.width || buf->height != D.height || buf->stride != D.stride)) {
+        buf->~RemoteWindowBuffer();
+        new (buf) RemoteWindowBuffer(
+            D.width, D.height, D.stride,
+            HAL_PIXEL_FORMAT_RGBA_8888,
+            kRwbUsage, in_handle);
+    }
+
+    int presentFence = -1;
+    uint32_t numTypes = 0;
+    uint32_t numRequests = 0;
+
+    hwc2_error_t error = hwc2_compat_display_validate(D.hwcDisplay, &numTypes, &numRequests);
+
+    if (error == HWC2_ERROR_HAS_CHANGES)
+        error = hwc2_compat_display_accept_changes(D.hwcDisplay);
+
+    if (error != HWC2_ERROR_NONE) {
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
+        g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+        evdi_swap_ack(poll_id, drm_fd, -1);
+        return;
+    }
+
+    hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
+                                          acquire_fence_fd, HAL_DATASPACE_UNKNOWN);
+    // now owned by hwc
+    acquire_fence_fd = -1;
+
+    error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
+    if (error != HWC2_ERROR_NONE) {
+        if (presentFence >= 0)
+            close(presentFence);
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
+        g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+        evdi_swap_ack(poll_id, drm_fd, -1);
+        return;
+    }
+    evdi_swap_ack(poll_id, drm_fd, presentFence);
+    g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+}
+
+static void present_worker_main()
+{
+    struct pollfd pfd;
+    std::memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = g_present_wake_efd;
+    pfd.events = POLLIN;
+
+    while (g_running.load(std::memory_order_acquire)) {
+        int rc = poll(&pfd, 1, 500 /* ms */);
+        if (rc <= 0)
+            continue;
+
+        uint64_t v;
+        while (read(g_present_wake_efd, &v, sizeof(v)) == (ssize_t)sizeof(v)) {}
+
+        for (int d = 0; d < kMaxDriverDisplays; d++) {
+            pending_swap ps;
+            {
+                std::lock_guard<std::mutex> lk(g_present_mu[d]);
+                if (!g_pending[d].valid)
+                    continue;
+                ps = g_pending[d];
+                g_pending[d].valid = false;
+            }
+            if (g_present_inflight[d].load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(g_present_mu[d]);
+                if (!g_pending[d].valid) {
+                    g_pending[d] = ps;
+                    g_pending[d].valid = true;
+                } else {
+                    if (ps.acquire_fence_fd >= 0)
+                        close(ps.acquire_fence_fd);
+                    evdi_swap_ack(ps.poll_id, drm_fd, -1);
+                }
+                continue;
+            }
+
+            g_present_inflight[d].store(true, std::memory_order_release);
+            g_need_present[d].store(false, std::memory_order_release);
+            present_one(drm_fd, d, ps.id, ps.poll_id, ps.acquire_fence_fd);
+        }
+    }
 }
 
 int add_handle(const native_handle_t& handle) {
@@ -434,6 +628,16 @@ int update_display(int display_id);
 void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
                      hwc2_display_t display, int64_t timestamp)
 {
+    const long long hwc_id = (long long)display;
+    const int drv_id = drv_id_for_hwc(hwc_id);
+    if (drv_id >= 0 && drv_id < kMaxDriverDisplays) {
+        Display& D = get_or_create_display(drv_id);
+        D.seen_vsync.store(true, std::memory_order_release);
+        if (g_need_present[drv_id].load(std::memory_order_acquire) &&
+            !g_present_inflight[drv_id].load(std::memory_order_acquire)) {
+            present_worker_wake();
+        }
+    }
 }
 
 static inline int drv_id_for_hwc(long long hwc_id) {
@@ -609,85 +813,35 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
-    struct { int id; int display_id; } ex = { -1, 0 };
-    int ret;
-    uint32_t numTypes = 0;
-    uint32_t numRequests = 0;
-    hwc2_error_t error = HWC2_ERROR_NONE;
+    drm_evdi_swap_event ex = { -1, 0, -1 };
     memcpy(&ex, data, sizeof(ex));
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
+    const int acquire_fence_fd = ex.acquire_fence_fd;
 
-    buffer_handle_t in_handle = get_handle(id);
-    RemoteWindowBuffer *buf = nullptr;
-    if (unlikely(in_handle == nullptr)) {
-        printf("Failed to find buf: %d\n", id);
-        struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+    if (unlikely(drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)) {
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
+        evdi_swap_ack(poll_id, drm_fd, -1);
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lk(g_present_mu[drv_display_id]);
+        if (g_pending[drv_display_id].valid) {
+            if (g_pending[drv_display_id].acquire_fence_fd >= 0)
+                close(g_pending[drv_display_id].acquire_fence_fd);
+            evdi_swap_ack(g_pending[drv_display_id].poll_id, drm_fd, -1);
+        }
+        g_pending[drv_display_id].valid = true;
+        g_pending[drv_display_id].id = id;
+        g_pending[drv_display_id].poll_id = poll_id;
+        g_pending[drv_display_id].acquire_fence_fd = acquire_fence_fd;
+    }
+    g_need_present[drv_display_id].store(true, std::memory_order_release);
     Display& D = get_or_create_display(drv_display_id);
-    if (unlikely(!D.hwcDisplay || D.width == 0 || D.height == 0)) {
-        printf("Display %d not ready (no HWC or size)\n", drv_display_id);
-        evdi_swap_ack(poll_id, drm_fd);
-        return;
-    }
-
-    auto it_buf = buffers_map.find(id);
-    if (it_buf == buffers_map.end()) {
-        void* mem = g_rwb_pool.acquire();
-        RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
-            D.width, D.height, D.stride,
-            HAL_PIXEL_FORMAT_RGBA_8888,
-            kRwbUsage, in_handle);
-        it_buf = buffers_map.emplace(id, UniqueRwb(rb)).first;
-    }
-
-    buf = it_buf->second.get();
-    if (unlikely(buf->width != D.width || buf->height != D.height || buf->stride != D.stride)) {
-        buf->~RemoteWindowBuffer();
-        new (buf) RemoteWindowBuffer(
-            D.width, D.height, D.stride,
-            HAL_PIXEL_FORMAT_RGBA_8888,
-            kRwbUsage, in_handle);
-    }
-
-    error = hwc2_compat_display_validate(D.hwcDisplay, &numTypes, &numRequests);
-    if (error != HWC2_ERROR_NONE && error != HWC2_ERROR_HAS_CHANGES) {
-        std::cerr << "prepare: validate failed for display " << D.hwcDisplay << error << std::endl;
-        return;
-    }
-
-    if (numTypes || numRequests) {
-        std::cerr << "prepare: validate required changes for display " << error << std::endl;
-        return;
-    }
-
-    error = hwc2_compat_display_accept_changes(D.hwcDisplay);
-    if (error != HWC2_ERROR_NONE) {
-        std::cerr << "prepare: acceptChanges failed: " << error << std::endl;
-        return;
-    }
-
-    if (buf->width > D.width || buf->height > D.height) {
-        evdi_swap_ack(poll_id, drm_fd);
-        return;
-    }
-
-    hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
-                                              -1,
-                                              HAL_DATASPACE_UNKNOWN);
-
-    int presentFence = -1;
-    error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
-    if (error != HWC2_ERROR_NONE) {
-        std::cerr << "Failed to present display: " << error << std::endl;
-    }
-    if (presentFence >= 0)
-        close(presentFence);
-
-    evdi_swap_ack(poll_id, drm_fd);
+    if (!D.seen_vsync.load(std::memory_order_acquire))
+        present_worker_wake();
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
@@ -829,8 +983,13 @@ static void poll_thread_main()
         poll_cmd.data = poll_payload;
 
         int ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
-        if (ret)
+        if (ret) {
+            /* Shutdown should break blocking ioctls */
+            if (errno == EINTR &&
+                !g_running.load(std::memory_order_acquire))
+                break;
             continue;
+        }
 
         switch (poll_cmd.event) {
         case add_buf:
@@ -858,16 +1017,27 @@ static void handle_signal(int signo)
 {
     (void)signo;
     g_running.store(false, std::memory_order_release);
+    present_worker_wake();
+}
+
+static void handle_wake_signal(int signo)
+{
+    (void)signo;
 }
 
 static void install_signal_handlers()
 {
     struct sigaction sa;
+    struct sigaction sa_wake;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    std::memset(&sa_wake, 0, sizeof(sa_wake));
+    sa_wake.sa_handler = handle_wake_signal;
+    sigemptyset(&sa_wake.sa_mask);
+    sigaction(SIGUSR1, &sa_wake, nullptr);
 }
 
 int main() {
@@ -888,6 +1058,11 @@ int main() {
     g_hwc_to_drv.reserve(kMaxDriverDisplays);
     g_drv_to_hwc.reserve(kMaxDriverDisplays);
 
+    for (int i = 0; i < kMaxDriverDisplays; ++i) {
+        g_present_inflight[i].store(false, std::memory_order_relaxed);
+        g_need_present[i].store(false, std::memory_order_relaxed);
+    }
+
     // Wait up to 5s for evdi; then open
     drm_fd = -1;
     for (int i = 0; i < 5 * 1000; ++i) {
@@ -899,6 +1074,16 @@ int main() {
     if (drm_fd < 0) drm_fd = open_evdi_lindroid_or_create();
     if (drm_fd < 0) return EXIT_FAILURE;
     drm_ready = true;
+
+    g_present_wake_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (g_present_wake_efd >= 0) {
+        try {
+            g_present_thread = std::thread(present_worker_main);
+        } catch (...) {
+            close(g_present_wake_efd);
+            g_present_wake_efd = -1;
+        }
+    }
 
     hwcDevice = hwc2_compat_device_new(false);
     if (!hwcDevice)
@@ -943,7 +1128,16 @@ int main() {
     // Shutdown
     sd_notify(0, "STATUS=Stopping poll thread…");
     if (g_poll_thread.joinable())
+        pthread_kill(g_poll_thread.native_handle(), SIGUSR1);
+    if (g_poll_thread.joinable())
         g_poll_thread.join();
+
+    present_worker_wake();
+    if (g_present_thread.joinable())
+        g_present_thread.join();
+    if (g_present_wake_efd >= 0)
+        close(g_present_wake_efd);
+    g_present_wake_efd = -1;
 
     close(drm_fd);
     sd_notify(0, "STATUS=Shutting down…");
