@@ -334,6 +334,7 @@ struct pending_swap {
 
 static std::thread g_present_thread;
 static int g_present_wake_efd = -1;
+static int g_shutdown_efd = -1;
 static std::mutex g_present_mu[kMaxDriverDisplays];
 static pending_swap g_pending[kMaxDriverDisplays];
 
@@ -351,7 +352,28 @@ static inline void present_worker_wake()
 
 native_handle_t* get_handle(int id);
 
-static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int acquire_fence_fd)
+static int wait_fence_interruptible(int fence_fd, int interrupt_fd) {
+    if (fence_fd < 0)
+        return 0;
+
+    struct pollfd fds[2] = {
+        { .fd = fence_fd,      .events = POLLIN },
+        { .fd = interrupt_fd,  .events = POLLIN }
+    };
+
+    int ret = poll(fds, 2, 1000);
+
+    if (ret < 0)
+        return -errno;
+    if (ret == 0)
+        return -ETIMEDOUT;
+    if (fds[1].revents & (POLLIN | POLLHUP | POLLERR))
+        return -EINTR;
+
+    return 0;
+}
+
+static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int acquire_fence_fd)
 {
     std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
 
@@ -359,7 +381,7 @@ static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int
         if (acquire_fence_fd >= 0)
             close(acquire_fence_fd);
         evdi_swap_ack(poll_id, drm_fd, -1);
-        return;
+        return 0;
     }
 
     buffer_handle_t in_handle = get_handle(id);
@@ -368,7 +390,7 @@ static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int
             close(acquire_fence_fd);
         g_present_inflight[drv_display_id].store(false, std::memory_order_release);
         evdi_swap_ack(poll_id, drm_fd, -1);
-        return;
+        return 0;
     }
 
     Display& D = get_or_create_display(drv_display_id);
@@ -377,7 +399,7 @@ static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int
             close(acquire_fence_fd);
         g_present_inflight[drv_display_id].store(false, std::memory_order_release);
         evdi_swap_ack(poll_id, drm_fd, -1);
-        return;
+        return 0;
     }
 
     RemoteWindowBuffer *buf = nullptr;
@@ -400,6 +422,22 @@ static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int
             kRwbUsage, in_handle);
     }
 
+    if (acquire_fence_fd >= 0) {
+        struct drm_evdi_set_acquire_fence fence_cmd;
+        fence_cmd.id = id;
+        fence_cmd.display_id = (uint32_t)drv_display_id;
+        fence_cmd.acquire_fence_fd = acquire_fence_fd;
+        (void)ioctl(drm_fd, DRM_IOCTL_EVDI_SET_ACQUIRE_FENCE, &fence_cmd);
+        int ret = wait_fence_interruptible(acquire_fence_fd, g_shutdown_efd);
+        if (ret == -EINTR || !g_running.load(std::memory_order_acquire)) {
+            if (acquire_fence_fd >= 0)
+                close(acquire_fence_fd);
+            g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+            evdi_swap_ack(poll_id, drm_fd, -1);
+            return -EINTR; 
+        }
+    }
+
     int presentFence = -1;
     uint32_t numTypes = 0;
     uint32_t numRequests = 0;
@@ -413,10 +451,8 @@ static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int
         if (acquire_fence_fd >= 0)
             close(acquire_fence_fd);
         g_present_inflight[drv_display_id].store(false, std::memory_order_release);
-        evdi_swap_ack(poll_id, drm_fd, -1);
-        return;
+        return 0;
     }
-
     hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
                                           acquire_fence_fd, HAL_DATASPACE_UNKNOWN);
     // now owned by hwc
@@ -430,10 +466,22 @@ static void present_one(int drm_fd, int drv_display_id, int id, int poll_id, int
             close(acquire_fence_fd);
         g_present_inflight[drv_display_id].store(false, std::memory_order_release);
         evdi_swap_ack(poll_id, drm_fd, -1);
-        return;
+        return 0;
     }
-    evdi_swap_ack(poll_id, drm_fd, presentFence);
+    if (presentFence >= 0) {
+        int pret = wait_fence_interruptible(presentFence, g_shutdown_efd);
+        if (pret == -EINTR || !g_running.load(std::memory_order_acquire)) {
+            close(presentFence);
+            g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+            evdi_swap_ack(poll_id, drm_fd, -1);
+            return -EINTR;
+        }
+        close(presentFence);
+        presentFence = -1;
+    }
+    evdi_swap_ack(poll_id, drm_fd, -1);
     g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+    return 0;
 }
 
 static void present_worker_main()
@@ -475,7 +523,8 @@ static void present_worker_main()
 
             g_present_inflight[d].store(true, std::memory_order_release);
             g_need_present[d].store(false, std::memory_order_release);
-            present_one(drm_fd, d, ps.id, ps.poll_id, ps.acquire_fence_fd);
+            if (present_one(drm_fd, d, ps.id, ps.poll_id, ps.acquire_fence_fd) == -EINTR)
+                break;
         }
     }
 }
@@ -953,6 +1002,7 @@ int update_display(int display_id) {
         hwc2_compat_layer_set_source_crop(D.layer, 0.0f, 0.0f, config->width, config->height);
         hwc2_compat_layer_set_display_frame(D.layer, 0, 0, config->width, config->height);
         hwc2_compat_layer_set_visible_region(D.layer, 0, 0, config->width, config->height);
+        hwc2_compat_display_set_vsync_enabled(D.hwcDisplay, HWC2_VSYNC_ENABLE);
 
         int refresh_hz = get_refresh_hz_from_active_config(config);
 
