@@ -507,9 +507,20 @@ static void present_worker_main()
                 }
             }
             if (da.valid) {
+                if (da.release_fence_fd >= 0) {
+                    int wret = wait_fence_interruptible(da.release_fence_fd, g_shutdown_efd);
+                    if (wret == -EINTR && !g_running.load(std::memory_order_acquire)) {
+                        close(da.release_fence_fd);
+                        evdi_swap_ack(da.poll_id, drm_fd, -1);
+                        g_present_inflight[d].store(false, std::memory_order_release);
+                        continue;
+                    }
+                }
                 evdi_swap_ack(da.poll_id, drm_fd, da.release_fence_fd);
                 g_present_inflight[d].store(false, std::memory_order_release);
             }
+            if (g_present_inflight[d].load(std::memory_order_acquire))
+                continue;
             pending_swap ps;
             {
                 std::lock_guard<std::mutex> lk(g_present_mu[d]);
@@ -518,17 +529,14 @@ static void present_worker_main()
                 ps = g_pending[d];
                 g_pending[d].valid = false;
             }
-            if (g_present_inflight[d].load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> lk(g_present_mu[d]);
-                if (!g_pending[d].valid) {
-                    g_pending[d] = ps;
-                    g_pending[d].valid = true;
-                } else {
-                    if (ps.acquire_fence_fd >= 0)
-                        close(ps.acquire_fence_fd);
-                    evdi_swap_ack(ps.poll_id, drm_fd, -1);
-                }
-                continue;
+            std::lock_guard<std::mutex> lk(g_present_mu[d]);
+            if (!g_pending[d].valid) {
+                g_pending[d] = ps;
+                g_pending[d].valid = true;
+            } else {
+                if (ps.acquire_fence_fd >= 0)
+                    close(ps.acquire_fence_fd);
+                evdi_swap_ack(ps.poll_id, drm_fd, -1);
             }
 
             g_present_inflight[d].store(true, std::memory_order_release);
@@ -898,11 +906,6 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     {
         std::lock_guard<std::mutex> lk(g_present_mu[drv_display_id]);
-        if (g_pending[drv_display_id].valid) {
-            if (g_pending[drv_display_id].acquire_fence_fd >= 0)
-                close(g_pending[drv_display_id].acquire_fence_fd);
-            evdi_swap_ack(g_pending[drv_display_id].poll_id, drm_fd, -1);
-        }
         g_pending[drv_display_id].valid = true;
         g_pending[drv_display_id].id = id;
         g_pending[drv_display_id].poll_id = poll_id;
@@ -1209,6 +1212,9 @@ int main() {
     // Shutdown
     sd_notify(0, "STATUS=Stopping poll thread…");
 
+    for (int d = 0; d < kMaxDriverDisplays; ++d)
+        (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)d, 0);
+
     g_running.store(false, std::memory_order_release);
     shutdown_wake();
 
@@ -1216,9 +1222,6 @@ int main() {
         pthread_kill(g_poll_thread.native_handle(), SIGUSR1);
     if (g_poll_thread.joinable())
         g_poll_thread.join();
-
-    for (int d = 0; d < kMaxDriverDisplays; ++d)
-        (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)d, 0);
 
     present_worker_wake();
     if (g_present_thread.joinable())
