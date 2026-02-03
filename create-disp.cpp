@@ -333,6 +333,12 @@ static int g_present_wake_efd = -1;
 static int g_shutdown_efd = -1;
 static std::mutex g_present_mu[kMaxDriverDisplays];
 static pending_swap g_pending[kMaxDriverDisplays];
+struct delayed_ack {
+    bool valid = false;
+    int poll_id = 0;
+    int release_fence_fd = -1;
+};
+static delayed_ack g_delayed[kMaxDriverDisplays];
 
 /* Serialize HWC / display state changes vs present thread. */
 static std::mutex g_hwc_mu;
@@ -390,7 +396,8 @@ static int wait_fence_interruptible(int fencefd, int shutdownfd)
 
 native_handle_t* get_handle(int id);
 
-static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int acquire_fence_fd)
+static int present_one(int drm_fd, int drv_display_id, int id, int poll_id,
+                       int acquire_fence_fd, int *out_release_fence_fd)
 {
     std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
 
@@ -460,33 +467,16 @@ static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int 
     // now owned by hwc
     acquire_fence_fd = -1;
 
-    /*
     error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
     if (error != HWC2_ERROR_NONE) {
         if (presentFence >= 0)
             close(presentFence);
         if (acquire_fence_fd >= 0)
             close(acquire_fence_fd);
-        g_present_inflight[drv_display_id].store(false, std::memory_order_release);
         evdi_swap_ack(poll_id, drm_fd, -1);
         return 0;
     }
-    */
-    int release_fence = -1;
-    if (presentFence >= 0) {
-        int wret = wait_fence_interruptible(presentFence, g_shutdown_efd);
-        if (wret == -EINTR && !g_running.load(std::memory_order_acquire)) {
-            close(presentFence);
-            g_present_inflight[drv_display_id].store(false, std::memory_order_release);
-            evdi_swap_ack(poll_id, drm_fd, -1);
-            return -EINTR;
-        }
-        release_fence = presentFence;
-        presentFence = -1;
-    }
-
-    evdi_swap_ack(poll_id, drm_fd, release_fence);
-    g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+    *out_release_fence_fd = presentFence;
     return 0;
 }
 
@@ -506,6 +496,20 @@ static void present_worker_main()
         while (read(g_present_wake_efd, &v, sizeof(v)) == (ssize_t)sizeof(v)) {}
 
         for (int d = 0; d < kMaxDriverDisplays; d++) {
+            delayed_ack da;
+            {
+                std::lock_guard<std::mutex> lk(g_present_mu[d]);
+                if (g_delayed[d].valid) {
+                    da = g_delayed[d];
+                    g_delayed[d].valid = false;
+                } else {
+                    da.valid = false;
+                }
+            }
+            if (da.valid) {
+                evdi_swap_ack(da.poll_id, drm_fd, da.release_fence_fd);
+                g_present_inflight[d].store(false, std::memory_order_release);
+            }
             pending_swap ps;
             {
                 std::lock_guard<std::mutex> lk(g_present_mu[d]);
@@ -529,8 +533,14 @@ static void present_worker_main()
 
             g_present_inflight[d].store(true, std::memory_order_release);
             g_need_present[d].store(false, std::memory_order_release);
-            if (present_one(drm_fd, d, ps.id, ps.poll_id, ps.acquire_fence_fd) == -EINTR)
-                break;
+            int release_fd = -1;
+            (void)present_one(drm_fd, d, ps.id, ps.poll_id, ps.acquire_fence_fd, &release_fd);
+            {
+                std::lock_guard<std::mutex> lk(g_present_mu[d]);
+                g_delayed[d].valid = true;
+                g_delayed[d].poll_id = ps.poll_id;
+                g_delayed[d].release_fence_fd = release_fd;
+            }
         }
     }
 }
@@ -689,12 +699,10 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
         bool has_pending = false;
         {
             std::lock_guard<std::mutex> lk(g_present_mu[drv_id]);
-            has_pending = g_pending[drv_id].valid;
+            has_pending = g_pending[drv_id].valid || g_delayed[drv_id].valid;
         }
-        if (has_pending &&
-            !g_present_inflight[drv_id].load(std::memory_order_acquire)) {
+        if (has_pending)
             present_worker_wake();
-        }
     }
 }
 
@@ -1042,6 +1050,8 @@ int update_display(int display_id) {
 // Dedicated poll thread
 static void poll_thread_main()
 {
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr);
     for (;;) {
         if (!g_running.load(std::memory_order_acquire))
             break;
@@ -1202,13 +1212,13 @@ int main() {
     g_running.store(false, std::memory_order_release);
     shutdown_wake();
 
-    for (int d = 0; d < kMaxDriverDisplays; ++d)
-        (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)d, 0);
-
     if (g_poll_thread.joinable())
         pthread_kill(g_poll_thread.native_handle(), SIGUSR1);
     if (g_poll_thread.joinable())
         g_poll_thread.join();
+
+    for (int d = 0; d < kMaxDriverDisplays; ++d)
+        (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)d, 0);
 
     present_worker_wake();
     if (g_present_thread.joinable())
