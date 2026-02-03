@@ -51,7 +51,6 @@ struct drm_evdi_swap_callback;
 #define DRM_EVDI_GBM_DEL_BUFF 0x0B
 #define DRM_EVDI_GBM_CREATE_BUFF 0x0C
 #define DRM_EVDI_GBM_CREATE_BUFF_CALLBACK 0x0D
-#define DRM_EVDI_SET_ACQUIRE_FENCE 0x0E
 
 #define DRM_IOCTL_EVDI_CONNECT DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_CONNECT, struct drm_evdi_connect)
@@ -77,8 +76,6 @@ struct drm_evdi_swap_callback;
         DRM_EVDI_SWAP_CALLBACK, struct drm_evdi_swap_callback)
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
-#define DRM_IOCTL_EVDI_SET_ACQUIRE_FENCE DRM_IOWR(DRM_COMMAND_BASE +  \
-        DRM_EVDI_SET_ACQUIRE_FENCE, struct drm_evdi_set_acquire_fence)
 
 static const int kMaxDriverDisplays = 5;
 static std::unordered_map<long long, int> g_hwc_to_drv;
@@ -278,12 +275,6 @@ struct drm_evdi_swap_event {
         int acquire_fence_fd;
 };
 
-struct drm_evdi_set_acquire_fence {
-        int id;
-        uint32_t display_id;
-        int acquire_fence_fd;
-};
-
 struct drm_evdi_swap_callback {
         int poll_id;
         int release_fence_fd;
@@ -352,27 +343,6 @@ static inline void present_worker_wake()
 
 native_handle_t* get_handle(int id);
 
-static int wait_fence_interruptible(int fence_fd, int interrupt_fd) {
-    if (fence_fd < 0)
-        return 0;
-
-    struct pollfd fds[2] = {
-        { .fd = fence_fd,      .events = POLLIN },
-        { .fd = interrupt_fd,  .events = POLLIN }
-    };
-
-    int ret = poll(fds, 2, 1000);
-
-    if (ret < 0)
-        return -errno;
-    if (ret == 0)
-        return -ETIMEDOUT;
-    if (fds[1].revents & (POLLIN | POLLHUP | POLLERR))
-        return -EINTR;
-
-    return 0;
-}
-
 static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int acquire_fence_fd)
 {
     std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
@@ -422,22 +392,6 @@ static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int 
             kRwbUsage, in_handle);
     }
 
-    if (acquire_fence_fd >= 0) {
-        struct drm_evdi_set_acquire_fence fence_cmd;
-        fence_cmd.id = id;
-        fence_cmd.display_id = (uint32_t)drv_display_id;
-        fence_cmd.acquire_fence_fd = acquire_fence_fd;
-        (void)ioctl(drm_fd, DRM_IOCTL_EVDI_SET_ACQUIRE_FENCE, &fence_cmd);
-        int ret = wait_fence_interruptible(acquire_fence_fd, g_shutdown_efd);
-        if (ret == -EINTR || !g_running.load(std::memory_order_acquire)) {
-            if (acquire_fence_fd >= 0)
-                close(acquire_fence_fd);
-            g_present_inflight[drv_display_id].store(false, std::memory_order_release);
-            evdi_swap_ack(poll_id, drm_fd, -1);
-            return -EINTR; 
-        }
-    }
-
     int presentFence = -1;
     uint32_t numTypes = 0;
     uint32_t numRequests = 0;
@@ -468,18 +422,7 @@ static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int 
         evdi_swap_ack(poll_id, drm_fd, -1);
         return 0;
     }
-    if (presentFence >= 0) {
-        int pret = wait_fence_interruptible(presentFence, g_shutdown_efd);
-        if (pret == -EINTR || !g_running.load(std::memory_order_acquire)) {
-            close(presentFence);
-            g_present_inflight[drv_display_id].store(false, std::memory_order_release);
-            evdi_swap_ack(poll_id, drm_fd, -1);
-            return -EINTR;
-        }
-        close(presentFence);
-        presentFence = -1;
-    }
-    evdi_swap_ack(poll_id, drm_fd, -1);
+    evdi_swap_ack(poll_id, drm_fd, presentFence);
     g_present_inflight[drv_display_id].store(false, std::memory_order_release);
     return 0;
 }
@@ -869,6 +812,13 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     const int acquire_fence_fd = ex.acquire_fence_fd;
 
     if (unlikely(drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)) {
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
+        evdi_swap_ack(poll_id, drm_fd, -1);
+        return;
+    }
+
+    if (g_present_wake_efd < 0) {
         if (acquire_fence_fd >= 0)
             close(acquire_fence_fd);
         evdi_swap_ack(poll_id, drm_fd, -1);
