@@ -460,6 +460,7 @@ static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int 
     // now owned by hwc
     acquire_fence_fd = -1;
 
+    /*
     error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
     if (error != HWC2_ERROR_NONE) {
         if (presentFence >= 0)
@@ -470,6 +471,7 @@ static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int 
         evdi_swap_ack(poll_id, drm_fd, -1);
         return 0;
     }
+    */
     int release_fence = -1;
     if (presentFence >= 0) {
         int wret = wait_fence_interruptible(presentFence, g_shutdown_efd);
@@ -877,14 +879,12 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     if (unlikely(drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)) {
         if (acquire_fence_fd >= 0)
             close(acquire_fence_fd);
-        evdi_swap_ack(poll_id, drm_fd, -1);
         return;
     }
 
     if (g_present_wake_efd < 0) {
         if (acquire_fence_fd >= 0)
             close(acquire_fence_fd);
-        evdi_swap_ack(poll_id, drm_fd, -1);
         return;
     }
 
