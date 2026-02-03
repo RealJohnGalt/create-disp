@@ -161,7 +161,6 @@ struct Display {
     uint32_t stride = 0;
     hwc2_compat_display_t* hwcDisplay = nullptr;
     hwc2_compat_layer_t* layer = nullptr;
-    std::atomic<bool> boot_kicked{false};
 };
 
 static std::unordered_map<int, Display> g_displays;
@@ -194,14 +193,19 @@ static inline Display& get_or_create_display(int display_id) {
 }
 
 struct HandleInfo {
-    std::unique_ptr<native_handle_t> handle;
+    struct FreeDeleter {
+        void operator()(native_handle_t* p) const { if (p) std::free(p); }
+    };
+    using UniqueHandle = std::unique_ptr<native_handle_t, FreeDeleter>;
+    UniqueHandle handle;
     int id;
 };
 
 int drm_fd;
 hwc2_compat_device_t* hwcDevice;
 static std::unordered_map<int, UniqueRwb> buffers_map;
-static std::unordered_map<int, std::unique_ptr<native_handle_t>> handles_map;
+static HandleInfo::UniqueHandle make_unique_handle(native_handle_t* p) { return HandleInfo::UniqueHandle(p); }
+static std::unordered_map<int, HandleInfo::UniqueHandle> handles_map;
 static std::unordered_map<uint64_t, std::vector<int>> handle_index;
 static std::unordered_map<int, uint64_t> handle_hash_by_id;
 static inline bool handles_equal(const native_handle_t* a, const native_handle_t* b) {
@@ -372,7 +376,7 @@ static int wait_fence_interruptible(int fencefd, int shutdownfd)
         int ret = poll(fds, nfds, -1);
         if (ret < 0) {
             if (errno == EINTR)
-                return -EINTR;
+                continue;
             return -errno;
         }
 
@@ -542,7 +546,7 @@ int add_handle(const native_handle_t& handle) {
         next_id = 1;
 
     int id = next_id++;
-    handles_map[id] = std::unique_ptr<native_handle_t>(copied_handle);
+    handles_map[id] = make_unique_handle(copied_handle);
     return id;
 }
 
@@ -679,7 +683,17 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
 {
     const long long hwc_id = (long long)display;
     const int drv_id = drv_id_for_hwc(hwc_id);
-    if (!D.boot_kicked.exchange(true, std::memory_order_acq_rel))
+    if (drv_id >= 0 && drv_id < kMaxDriverDisplays) {
+        bool has_pending = false;
+        {
+            std::lock_guard<std::mutex> lk(g_present_mu[drv_id]);
+            has_pending = g_pending[drv_id].valid;
+        }
+        if (has_pending &&
+            !g_present_inflight[drv_id].load(std::memory_order_acquire)) {
+            present_worker_wake();
+        }
+    }
 }
 
 static inline int drv_id_for_hwc(long long hwc_id) {
@@ -920,7 +934,6 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
             std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
             buffers_map.erase(id);
         }
-	buffers_map.erase(id);
         handles_map.erase(id);
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
         ret=ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
@@ -960,6 +973,8 @@ int update_display(int display_id) {
 	return -1;
 
     std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
+    (void)hwc2_compat_display_set_vsync_enabled(D.hwcDisplay,
+                                               HWC2_VSYNC_ENABLE);
     HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(D.hwcDisplay);
     if (!config) {
         fprintf(stderr, "update_display(%d): no active HWC config yet, will retry on next refresh\n",
@@ -1183,14 +1198,13 @@ int main() {
 
     // Shutdown
     sd_notify(0, "STATUS=Stopping poll thread…");
-    for (const auto& kv : g_displays) {
-        const int d = kv.first;
-        if (d < 0 || d >= kMaxDriverDisplays)
-            continue;
-        if (kv.second.hwcDisplay) {
-            (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)d, 0);
-        }
-    }
+
+    g_running.store(false, std::memory_order_release);
+    shutdown_wake();
+
+    for (int d = 0; d < kMaxDriverDisplays; ++d)
+        (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)d, 0);
+
     if (g_poll_thread.joinable())
         pthread_kill(g_poll_thread.native_handle(), SIGUSR1);
     if (g_poll_thread.joinable())
