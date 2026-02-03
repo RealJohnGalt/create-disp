@@ -161,7 +161,7 @@ struct Display {
     uint32_t stride = 0;
     hwc2_compat_display_t* hwcDisplay = nullptr;
     hwc2_compat_layer_t* layer = nullptr;
-    std::atomic<bool> seen_vsync{false};
+    std::atomic<bool> boot_kicked{false};
 };
 
 static std::unordered_map<int, Display> g_displays;
@@ -679,20 +679,7 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
 {
     const long long hwc_id = (long long)display;
     const int drv_id = drv_id_for_hwc(hwc_id);
-    if (drv_id >= 0 && drv_id < kMaxDriverDisplays) {
-        Display& D = get_or_create_display(drv_id);
-        D.seen_vsync.store(true, std::memory_order_release);
-        bool has_pending = false;
-        {
-            std::lock_guard<std::mutex> lk(g_present_mu[drv_id]);
-            has_pending = g_pending[drv_id].valid;
-        }
-
-        if (has_pending &&
-            !g_present_inflight[drv_id].load(std::memory_order_acquire)) {
-            present_worker_wake();
-        }
-    }
+    if (!D.boot_kicked.exchange(true, std::memory_order_acq_rel))
 }
 
 static inline int drv_id_for_hwc(long long hwc_id) {
