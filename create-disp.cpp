@@ -532,7 +532,6 @@ HWC2EventListener eventListener = {
 
 void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     int fd;
-    native_handle_t handle;
     int id = -1;
     memcpy(&fd, data, sizeof(int));
     if (fcntl(fd, F_GETFD) == -1) {
@@ -548,7 +547,7 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     int numFds = header[1];
     int numInts = header[2];
 
-    size_t total_size = sizeof(buffer_handle_t) + ((size_t)numFds + (size_t)numInts) * sizeof(int);
+    size_t total_size = sizeof(native_handle_t) + ((size_t)numFds + (size_t)numInts) * sizeof(int);
     void *blk = g_small_pool.alloc(total_size);
     native_handle_t *full_handle = (native_handle_t*)blk;
     if (!full_handle) {
