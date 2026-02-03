@@ -654,40 +654,9 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
             HAL_PIXEL_FORMAT_RGBA_8888,
             kRwbUsage, in_handle);
     }
-
-    error = hwc2_compat_display_validate(D.hwcDisplay, &numTypes, &numRequests);
-    if (error != HWC2_ERROR_NONE && error != HWC2_ERROR_HAS_CHANGES) {
-        std::cerr << "prepare: validate failed for display " << D.hwcDisplay << error << std::endl;
-        return;
-    }
-
-    if (numTypes || numRequests) {
-        std::cerr << "prepare: validate required changes for display " << error << std::endl;
-        return;
-    }
-
-    error = hwc2_compat_display_accept_changes(D.hwcDisplay);
-    if (error != HWC2_ERROR_NONE) {
-        std::cerr << "prepare: acceptChanges failed: " << error << std::endl;
-        return;
-    }
-
-    if (buf->width > D.width || buf->height > D.height) {
-        evdi_swap_ack(poll_id, drm_fd);
-        return;
-    }
-
     hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
                                               -1,
                                               HAL_DATASPACE_UNKNOWN);
-
-    int presentFence = -1;
-    error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
-    if (error != HWC2_ERROR_NONE) {
-        std::cerr << "Failed to present display: " << error << std::endl;
-    }
-    if (presentFence >= 0)
-        close(presentFence);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
@@ -716,7 +685,7 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
                 }
                 handle_hash_by_id.erase(it_hh);
         }
-	buffers_map.erase(id);
+        buffers_map.erase(id);
         handles_map.erase(id);
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
         ret=ioctl(drm_fd, DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
