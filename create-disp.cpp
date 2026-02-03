@@ -728,7 +728,6 @@ HWC2EventListener eventListener = {
 
 void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     int fd;
-    native_handle_t handle;
     int id = -1;
     memcpy(&fd, data, sizeof(int));
     if (fcntl(fd, F_GETFD) == -1) {
@@ -744,7 +743,7 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     int numFds = header[1];
     int numInts = header[2];
 
-    size_t total_size = sizeof(buffer_handle_t) + ((size_t)numFds + (size_t)numInts) * sizeof(int);
+    size_t total_size = sizeof(native_handle_t) + ((size_t)numFds + (size_t)numInts) * sizeof(int);
     void *blk = g_small_pool.alloc(total_size);
     native_handle_t *full_handle = (native_handle_t*)blk;
     if (!full_handle) {
@@ -869,6 +868,10 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
                 }
                 handle_hash_by_id.erase(it_hh);
         }
+        {
+            std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
+            buffers_map.erase(id);
+        }
 	buffers_map.erase(id);
         handles_map.erase(id);
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
@@ -905,7 +908,10 @@ static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg
 }
 int update_display(int display_id) {
     Display& D = get_or_create_display(display_id);
-    if (!D.hwcDisplay) return -1;
+    if (!D.hwcDisplay)
+	return -1;
+
+    std::lock_guard<std::mutex> hwc_lk(g_hwc_mu);
     HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(D.hwcDisplay);
     if (!config) {
         fprintf(stderr, "update_display(%d): no active HWC config yet, will retry on next refresh\n",
