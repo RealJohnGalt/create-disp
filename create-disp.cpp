@@ -157,6 +157,7 @@ struct Display {
     int display_id = -1;
     int width = 0;
     int height = 0;
+    int refresh_hz = 60;
     uint32_t stride = 0;
     hwc2_compat_display_t* hwcDisplay = nullptr;
     hwc2_compat_layer_t* layer = nullptr;
@@ -341,6 +342,48 @@ static inline void present_worker_wake()
     (void)rc;
 }
 
+static inline void shutdown_wake()
+{
+    if (g_shutdown_efd < 0)
+        return;
+    uint64_t one = 1;
+    ssize_t rc = write(g_shutdown_efd, &one, sizeof(one));
+    (void)rc;
+}
+
+static int wait_fence_interruptible(int fencefd, int shutdownfd)
+{
+    if (fencefd < 0)
+        return 0;
+
+    struct pollfd fds[2];
+    std::memset(fds, 0, sizeof(fds));
+    fds[0].fd = fencefd;
+    fds[0].events = POLLIN;
+
+    int nfds = 1;
+    if (shutdownfd >= 0) {
+        fds[1].fd = shutdownfd;
+        fds[1].events = POLLIN;
+        nfds = 2;
+    }
+
+    for (;;) {
+        int ret = poll(fds, nfds, -1);
+        if (ret < 0) {
+            if (errno == EINTR)
+                return -EINTR;
+            return -errno;
+        }
+
+        if (nfds == 2 && (fds[1].revents & (POLLIN | POLLERR | POLLHUP)))
+            return -EINTR;
+
+        if (fds[0].revents & (POLLIN | POLLERR | POLLHUP))
+            return 0;
+    }
+}
+
 native_handle_t* get_handle(int id);
 
 static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int acquire_fence_fd)
@@ -405,6 +448,7 @@ static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int 
         if (acquire_fence_fd >= 0)
             close(acquire_fence_fd);
         g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+        evdi_swap_ack(poll_id, drm_fd, -1);
         return 0;
     }
     hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
@@ -422,7 +466,20 @@ static int present_one(int drm_fd, int drv_display_id, int id, int poll_id, int 
         evdi_swap_ack(poll_id, drm_fd, -1);
         return 0;
     }
-    evdi_swap_ack(poll_id, drm_fd, presentFence);
+    int release_fence = -1;
+    if (presentFence >= 0) {
+        int wret = wait_fence_interruptible(presentFence, g_shutdown_efd);
+        if (wret == -EINTR && !g_running.load(std::memory_order_acquire)) {
+            close(presentFence);
+            g_present_inflight[drv_display_id].store(false, std::memory_order_release);
+            evdi_swap_ack(poll_id, drm_fd, -1);
+            return -EINTR;
+        }
+        release_fence = presentFence;
+        presentFence = -1;
+    }
+
+    evdi_swap_ack(poll_id, drm_fd, release_fence);
     g_present_inflight[drv_display_id].store(false, std::memory_order_release);
     return 0;
 }
@@ -625,7 +682,13 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
     if (drv_id >= 0 && drv_id < kMaxDriverDisplays) {
         Display& D = get_or_create_display(drv_id);
         D.seen_vsync.store(true, std::memory_order_release);
-        if (g_need_present[drv_id].load(std::memory_order_acquire) &&
+        bool has_pending = false;
+        {
+            std::lock_guard<std::mutex> lk(g_present_mu[drv_id]);
+            has_pending = g_pending[drv_id].valid;
+        }
+
+        if (has_pending &&
             !g_present_inflight[drv_id].load(std::memory_order_acquire)) {
             present_worker_wake();
         }
@@ -838,8 +901,6 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     }
     g_need_present[drv_display_id].store(true, std::memory_order_release);
     Display& D = get_or_create_display(drv_display_id);
-    if (!D.seen_vsync.load(std::memory_order_acquire))
-        present_worker_wake();
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
@@ -960,16 +1021,16 @@ int update_display(int display_id) {
         hwc2_compat_layer_set_visible_region(D.layer, 0, 0, config->width, config->height);
         hwc2_compat_display_set_vsync_enabled(D.hwcDisplay, HWC2_VSYNC_ENABLE);
 
-        int refresh_hz = get_refresh_hz_from_active_config(config);
+	D.refresh_hz = get_refresh_hz_from_active_config(config);
 
         std::ostringstream oss;
         oss << "EDID for " << config->width << "x" << config->height
-            << "@" << refresh_hz << "Hz 'Lindroid display " << display_id << "'";
+            << "@" << D.refresh_hz << "Hz 'Lindroid display " << display_id << "'";
         std::cout << oss.str() << std::endl;
 
         if (evdi_connect(drm_fd, 0,
                          (uint32_t)config->width, (uint32_t)config->height,
-                         (uint32_t)refresh_hz, (uint32_t)display_id, 1) < 0) {
+                         (uint32_t)D.refresh_hz, (uint32_t)display_id, 1) < 0) {
             return EXIT_FAILURE;
         }
     }
@@ -1023,6 +1084,7 @@ static void handle_signal(int signo)
 {
     (void)signo;
     g_running.store(false, std::memory_order_release);
+    shutdown_wake();
     present_worker_wake();
 }
 
@@ -1082,6 +1144,7 @@ int main() {
     drm_ready = true;
 
     g_present_wake_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    g_shutdown_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (g_present_wake_efd >= 0) {
         try {
             g_present_thread = std::thread(present_worker_main);
@@ -1133,6 +1196,14 @@ int main() {
 
     // Shutdown
     sd_notify(0, "STATUS=Stopping poll thread…");
+    for (const auto& kv : g_displays) {
+        const int d = kv.first;
+        if (d < 0 || d >= kMaxDriverDisplays)
+            continue;
+        if (kv.second.hwcDisplay) {
+            (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)d, 0);
+        }
+    }
     if (g_poll_thread.joinable())
         pthread_kill(g_poll_thread.native_handle(), SIGUSR1);
     if (g_poll_thread.joinable())
@@ -1144,6 +1215,9 @@ int main() {
     if (g_present_wake_efd >= 0)
         close(g_present_wake_efd);
     g_present_wake_efd = -1;
+    if (g_shutdown_efd >= 0)
+        close(g_shutdown_efd);
+    g_shutdown_efd = -1;
 
     close(drm_fd);
     sd_notify(0, "STATUS=Shutting down…");
