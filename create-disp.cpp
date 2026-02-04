@@ -716,6 +716,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     int acquire_dup = (acquire_fd >= 0) ? dup(acquire_fd) : -1;
     if (acquire_fd >= 0) close(acquire_fd);
 
+    printf("acquire_dup: %d\n", acquire_dup);
+
     auto it_buf = buffers_map.find(id);
     if (it_buf == buffers_map.end()) {
         void* mem = g_rwb_pool.acquire();
