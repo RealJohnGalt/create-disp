@@ -15,6 +15,7 @@
 #include <vector>
 #include <new>
 #include <fstream>
+#include <poll.h>
 #include <cmath>
 #include <climits>
 #include <cstdint>
@@ -22,6 +23,8 @@
 #include <thread>
 #include <atomic>
 #include <csignal>
+#include <mutex>
+#include <condition_variable>
 
 #include <systemd/sd-daemon.h>
 
@@ -44,6 +47,7 @@ struct drm_evdi_swap_callback;
 #define DRM_EVDI_GBM_DEL_BUFF 0x0B
 #define DRM_EVDI_GBM_CREATE_BUFF 0x0C
 #define DRM_EVDI_GBM_CREATE_BUFF_CALLBACK 0x0D
+#define DRM_EVDI_SET_ACQUIRE_FENCE 0x0E
 
 #define DRM_IOCTL_EVDI_CONNECT DRM_IOWR(DRM_COMMAND_BASE +  \
         DRM_EVDI_CONNECT, struct drm_evdi_connect)
@@ -69,12 +73,63 @@ struct drm_evdi_swap_callback;
         DRM_EVDI_SWAP_CALLBACK, struct drm_evdi_swap_callback)
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
 	DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
+#define DRM_IOCTL_EVDI_SET_ACQUIRE_FENCE DRM_IOWR(DRM_COMMAND_BASE + \
+        DRM_EVDI_SET_ACQUIRE_FENCE, struct drm_evdi_set_acquire_fence)
 
 static const int kMaxDriverDisplays = 5;
 static std::unordered_map<long long, int> g_hwc_to_drv;
 static std::unordered_map<int, long long> g_drv_to_hwc;
 static std::vector<int> g_free_drv_ids;
 static volatile bool drm_ready = false;
+
+static constexpr uint32_t kHwcMaxSlots = 64;
+
+static std::unordered_map<uint64_t, uint32_t> g_slot_by_key;      // key=(display<<32)|buf_id
+static std::unordered_map<int, uint32_t> g_next_slot_by_display;  // display_id -> next slot
+
+static inline uint64_t slot_key_for(int display_id, int buf_id)
+{
+    return (uint64_t(uint32_t(display_id)) << 32) | uint32_t(buf_id);
+}
+
+static inline uint32_t slot_for_buffer(int display_id, int buf_id)
+{
+    const uint64_t key = slot_key_for(display_id, buf_id);
+    auto it = g_slot_by_key.find(key);
+    if (it != g_slot_by_key.end())
+        return it->second;
+
+    uint32_t &next = g_next_slot_by_display[display_id];
+    uint32_t slot = next % kHwcMaxSlots;
+    next++;
+    g_slot_by_key.emplace(key, slot);
+    return slot;
+}
+
+static inline void reset_slots_for_display(int display_id)
+{
+    for (auto it = g_slot_by_key.begin(); it != g_slot_by_key.end(); ) {
+        const uint32_t disp = uint32_t(it->first >> 32);
+        if ((int)disp == display_id) {
+            it = g_slot_by_key.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g_next_slot_by_display.erase(display_id);
+}
+
+static inline void erase_slots_for_id(int buf_id)
+{
+    for (auto it = g_slot_by_key.begin(); it != g_slot_by_key.end(); ) {
+        const uint32_t id = uint32_t(it->first & 0xffffffffu);
+        if ((int)id == buf_id) {
+            it = g_slot_by_key.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 namespace {
 struct SmallBufPool {
@@ -257,10 +312,6 @@ struct drm_evdi_destroy_buff_callback {
         int poll_id;
 };
 
-struct drm_evdi_swap_callback {
-        int poll_id;
-};
-
 struct drm_evdi_gbm_get_buff {
         int id;
         void *native_handle;
@@ -274,15 +325,35 @@ struct drm_evdi_gbm_create_buff {
 	uint32_t height;
 };
 
+struct drm_evdi_swap_event {
+        int id;
+        int display_id;
+        int acquire_fence_fd;
+};
+
+struct drm_evdi_swap_callback {
+        int poll_id;
+        int release_fence_fd;
+};
+
+struct drm_evdi_set_acquire_fence {
+        int id;
+        uint32_t display_id;
+        int acquire_fence_fd;
+};
+
 struct drm_evdi_create_buff_callabck {
 	int poll_id;
 	int id;
 	uint32_t stride;
 };
 
-static inline void evdi_swap_ack(int poll_id, int drm_fd)
+static inline void evdi_swap_reply(int poll_id, int drm_fd, int release_fence_fd)
 {
-	struct drm_evdi_swap_callback cmd = {.poll_id = poll_id};
+	struct drm_evdi_swap_callback cmd = {
+            .poll_id = poll_id,
+            .release_fence_fd = release_fence_fd,
+        };
 	ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
 }
 
@@ -608,20 +679,26 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
-    struct { int id; int display_id; } ex = { -1, 0 };
-    int ret;
+    drm_evdi_swap_event ex;
+    std::memset(&ex, 0, sizeof(ex));
+    ex.id = -1;
+    ex.display_id = 0;
+    ex.acquire_fence_fd = -1;
     uint32_t numTypes = 0;
     uint32_t numRequests = 0;
     hwc2_error_t error = HWC2_ERROR_NONE;
     memcpy(&ex, data, sizeof(ex));
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
+    int acquire_fd = ex.acquire_fence_fd;
+    const uint32_t slot = slot_for_buffer(drv_display_id, id);
 
-    struct SwapAckGuard {
+    struct SwapReplyGuard {
         int poll_id;
         int drm_fd;
-        ~SwapAckGuard() { evdi_swap_ack(poll_id, drm_fd); }
-    } ack{poll_id, drm_fd};
+        bool replied = false;
+        ~SwapReplyGuard() { if (!replied) evdi_swap_reply(poll_id, drm_fd, -1); }
+    } reply{poll_id, drm_fd};
 
     buffer_handle_t in_handle = get_handle(id);
     RemoteWindowBuffer *buf = nullptr;
@@ -635,6 +712,9 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         printf("Display %d not ready (no HWC or size)\n", drv_display_id);
         return;
     }
+
+    int acquire_dup = (acquire_fd >= 0) ? dup(acquire_fd) : -1;
+    if (acquire_fd >= 0) close(acquire_fd);
 
     auto it_buf = buffers_map.find(id);
     if (it_buf == buffers_map.end()) {
@@ -654,15 +734,41 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
             HAL_PIXEL_FORMAT_RGBA_8888,
             kRwbUsage, in_handle);
     }
-    hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
-                                              -1,
-                                              HAL_DATASPACE_UNKNOWN);
+
+    error = hwc2_compat_display_set_client_target(D.hwcDisplay,
+                                                 slot,
+                                                 buf,
+                                                 acquire_dup,
+                                                 HAL_DATASPACE_UNKNOWN);
+    if (error != HWC2_ERROR_NONE) {
+        if (acquire_dup >= 0) close(acquire_dup);
+        return;
+    }
+
+    error = hwc2_compat_display_validate(D.hwcDisplay, &numTypes, &numRequests);
+    if (error != HWC2_ERROR_NONE)
+        return;
+
+    if (numTypes || numRequests)
+        (void)hwc2_compat_display_accept_changes(D.hwcDisplay);
+
+    int present_fence_fd = -1;
+    error = hwc2_compat_display_present(D.hwcDisplay, &present_fence_fd);
+    if (error != HWC2_ERROR_NONE) {
+        if (present_fence_fd >= 0) close(present_fence_fd);
+        return;
+    }
+
+    evdi_swap_reply(poll_id, drm_fd, present_fence_fd);
+    reply.replied = true;
+    if (present_fence_fd >= 0) close(present_fence_fd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
         int id = *(int *)data;
         int ret;
         native_handle_t *handle = get_handle(id);
+        erase_slots_for_id(id);
         if(handle) {
                 native_handle_close(handle);
         }
@@ -749,6 +855,7 @@ int update_display(int display_id) {
     printf("display %d width: %i height: %i\n", display_id, config->width, config->height);
     if (D.width != config->width || D.height != config->height) {
         buffers_map.clear();
+        reset_slots_for_display(display_id);
         D.width = config->width;
         D.height = config->height;
         buffer_handle_t handle = NULL;
