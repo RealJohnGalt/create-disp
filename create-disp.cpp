@@ -693,6 +693,9 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     int acquire_fd = ex.acquire_fence_fd;
     const uint32_t slot = slot_for_buffer(drv_display_id, id);
 
+    fprintf(stderr, "swap_to_buff: poll_id=%d id=%d display=%d acquire_fd=%d\n",
+            poll_id, ex.id, ex.display_id, ex.acquire_fence_fd);
+
     struct SwapReplyGuard {
         int poll_id;
         int drm_fd;
