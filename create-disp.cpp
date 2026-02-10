@@ -719,8 +719,6 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     int acquire_dup = (acquire_fd >= 0) ? dup(acquire_fd) : -1;
     if (acquire_fd >= 0) close(acquire_fd);
 
-    printf("acquire_dup: %d\n", acquire_dup);
-
     auto it_buf = buffers_map.find(id);
     if (it_buf == buffers_map.end()) {
         void* mem = g_rwb_pool.acquire();
@@ -745,24 +743,14 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
                                                  buf,
                                                  acquire_dup,
                                                  HAL_DATASPACE_UNKNOWN);
-    if (error != HWC2_ERROR_NONE) {
-        if (acquire_dup >= 0) close(acquire_dup);
-        return;
-    }
 
     error = hwc2_compat_display_validate(D.hwcDisplay, &numTypes, &numRequests);
-    if (error != HWC2_ERROR_NONE)
-        return;
 
     if (numTypes || numRequests)
         (void)hwc2_compat_display_accept_changes(D.hwcDisplay);
 
     int present_fence_fd = -1;
     error = hwc2_compat_display_present(D.hwcDisplay, &present_fence_fd);
-    if (error != HWC2_ERROR_NONE) {
-        if (present_fence_fd >= 0) close(present_fence_fd);
-        return;
-    }
 
     evdi_swap_reply(poll_id, drm_fd, present_fence_fd);
     reply.replied = true;
