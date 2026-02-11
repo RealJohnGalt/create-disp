@@ -27,6 +27,7 @@ target_link_libraries(create-disp
     hybris-eglplatformcommon
     hybris-platformcommon
     gralloc
+    sync
     ${LIBDRM_LIBRARIES}
     ${SYSTEMD_LIBRARIES}
 )

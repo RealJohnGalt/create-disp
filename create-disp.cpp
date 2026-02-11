@@ -28,6 +28,7 @@
 #include <mutex>
 #include <condition_variable>
 
+#include <sync/sync.h>
 #include <systemd/sd-daemon.h>
 
 #include <hybris/hwc2/hwc2_compatibility_layer.h>
@@ -829,6 +830,20 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     int presentFence = -1;
     (void)hwc2_compat_display_present(hwcDisp, &presentFence);
+
+    if (presentFence >= 0) {
+        int rc;
+        do {
+            rc = sync_wait(presentFence, -1);
+        } while (rc < 0 && errno == EINTR);
+
+        if (rc < 0) {
+            fprintf(stderr, "sync_wait(presentFence=%d) failed: %s\n",
+                    presentFence, strerror(errno));
+        }
+        close(presentFence);
+        presentFence = -1;
+    }
 
     if (evdi_swap_reply(poll_id) == 0)
         reply.replied = true;
