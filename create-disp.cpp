@@ -396,8 +396,15 @@ struct drm_evdi_gbm_create_buff {
 	uint32_t height;
 };
 
+struct drm_evdi_swap {
+	int id;
+	int display_id;
+	int acquire_fence_fd;
+};
+
 struct drm_evdi_swap_callback {
         int poll_id;
+        int release_fence_fd;
 };
 
 struct drm_evdi_create_buff_callabck {
@@ -406,15 +413,19 @@ struct drm_evdi_create_buff_callabck {
 	uint32_t stride;
 };
 
-static inline int evdi_swap_reply(int poll_id)
+static inline int evdi_swap_reply(int poll_id, int release_fence_fd)
 {
-    struct drm_evdi_swap_callback cmd = {
-        .poll_id = poll_id,
-    };
+    struct drm_evdi_swap_callback cmd;
+    cmd.poll_id = poll_id;
+    cmd.release_fence_fd = release_fence_fd;
+
     int rc = drm_ioctl(DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
-    if (rc < 0 && (errno == ENODEV || errno == EBADF)) {
+    if (rc < 0 && (errno == ENODEV || errno == EBADF))
         request_reopen();
-    }
+
+    if (release_fence_fd >= 0)
+        close(release_fence_fd);
+
     return rc;
 }
 
@@ -749,21 +760,20 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
-    struct { int id; int display_id; } ex = { -1, 0 };
-    std::memset(&ex, 0, sizeof(ex));
-    ex.id = -1;
-    ex.display_id = 0;
+    int id = -1;
+    int drv_display_id = 0;
+    int acquire_fence_fd = -1;
+    std::memcpy(&id, data, sizeof(int));
+    std::memcpy(&drv_display_id, (const uint8_t *)data + sizeof(int), sizeof(int));
+    std::memcpy(&acquire_fence_fd, (const uint8_t *)data + (sizeof(int) * 2), sizeof(int));
     uint32_t numTypes = 0;
     uint32_t numRequests = 0;
     hwc2_error_t error = HWC2_ERROR_NONE;
-    memcpy(&ex, data, sizeof(ex));
-    const int id = ex.id;
-    const int drv_display_id = ex.display_id;
 
     struct SwapReplyGuard {
         int poll_id;
         bool replied = false;
-        ~SwapReplyGuard() { if (!replied) (void)evdi_swap_reply(poll_id); }
+        ~SwapReplyGuard() { if (!replied) (void)evdi_swap_reply(poll_id, -1); }
     } reply{poll_id};
 
     hwc2_compat_display_t* hwcDisp = nullptr;
@@ -776,6 +786,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         in_handle = get_handle_locked_nolock(id);
         if (unlikely(in_handle == nullptr)) {
+            if (acquire_fence_fd >= 0)
+                close(acquire_fence_fd);
             printf("Failed to find buf: %d\n", id);
             return;
         }
@@ -785,6 +797,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         slot = slot_for_buffer_locked(drv_display_id, id);
 
         if (!hwcDisp || D.width == 0 || D.height == 0 || D.stride == 0) {
+            if (acquire_fence_fd >= 0)
+                close(acquire_fence_fd);
             return;
         }
 
@@ -805,18 +819,25 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     if (unlikely(!hwcDisp || Dsnap.width == 0 || Dsnap.height == 0 || Dsnap.stride == 0 || !buf)) {
         printf("Display %d not ready (no HWC or size)\n", drv_display_id);
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
         return;
     }
 
-    error = hwc2_compat_display_set_client_target(hwcDisp,
-                                                 slot,
-                                                 buf,
-                                                 -1,
-                                                 HAL_DATASPACE_UNKNOWN);
+    // XXX deleteme
+    fprintf(stderr, "acquire_fence_fd: %d\n", acquire_fence_fd);
+
+    error = hwc2_compat_display_set_client_target(
+            hwcDisp, slot, buf, acquire_fence_fd, HAL_DATASPACE_UNKNOWN);
+
     if (error != HWC2_ERROR_NONE) {
         fprintf(stderr, "set_client_target failed: %d\n", (int)error);
+        if (acquire_fence_fd >= 0)
+            close(acquire_fence_fd);
         //return;
     }
+    /* ownership transferred */
+    acquire_fence_fd = -1;
 
     error = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
     if (error != HWC2_ERROR_NONE) {
@@ -828,9 +849,16 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         (void)hwc2_compat_display_accept_changes(hwcDisp);
 
     int presentFence = -1;
-    (void)hwc2_compat_display_present(hwcDisp, &presentFence);
+    error = hwc2_compat_display_present(hwcDisp, &presentFence);
+    if (error != HWC2_ERROR_NONE) {
+        fprintf(stderr, "present failed: %d\n", (int)error);
+        if (presentFence >= 0)
+            close(presentFence);
+    }
+    // XXX deleteme
+    fprintf(stderr, "presentFence: %d\n", presentFence);
 
-    if (evdi_swap_reply(poll_id) == 0)
+    if (evdi_swap_reply(poll_id, presentFence) == 0)
         reply.replied = true;
 
     return;
@@ -1097,6 +1125,8 @@ static void poll_thread_main()
         uint8_t poll_payload[32];
         poll_cmd.data = poll_payload;
 
+        // Ensure any fields kernel doesn't overwrite (legacy payloads) default to -1
+        std::memset(poll_payload, 0xFF, sizeof(poll_payload));
         int ret = drm_ioctl(DRM_IOCTL_EVDI_POLL, &poll_cmd);
         if (ret < 0) {
             if (errno == ENODEV || errno == EBADF) {
