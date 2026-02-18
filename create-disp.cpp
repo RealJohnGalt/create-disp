@@ -818,18 +818,6 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         //return;
     }
 
-    error = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
-    if (error != HWC2_ERROR_NONE) {
-        fprintf(stderr, "validate failed: %d\n", (int)error);
-        //return;
-    }
-
-    if (numTypes || numRequests)
-        (void)hwc2_compat_display_accept_changes(hwcDisp);
-
-    int presentFence = -1;
-    (void)hwc2_compat_display_present(hwcDisp, &presentFence);
-
     if (evdi_swap_reply(poll_id) == 0)
         reply.replied = true;
 
