@@ -1,6 +1,7 @@
 #include <inttypes.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <iostream>
 #include <sstream>
 #include <cstring>
@@ -330,8 +331,15 @@ struct drm_evdi_gbm_create_buff {
 	uint32_t height;
 };
 
+struct drm_evdi_swap {
+        int id;
+        int display_id;
+        int acquire_fence_fd;
+};
+
 struct drm_evdi_swap_callback {
         int poll_id;
+        int release_fence_fd;
 };
 
 struct drm_evdi_create_buff_callabck {
@@ -340,15 +348,12 @@ struct drm_evdi_create_buff_callabck {
 	uint32_t stride;
 };
 
-static inline int evdi_swap_reply(int poll_id)
+static inline int evdi_swap_reply_with_release_fence(int poll_id, int release_fence_fd)
 {
-    struct drm_evdi_swap_callback cmd = {
-        .poll_id = poll_id,
-    };
+    struct drm_evdi_swap_callback cmd = { .poll_id = poll_id, .release_fence_fd = release_fence_fd };
     int rc = drm_ioctl(DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
-    if (rc < 0 && (errno == ENODEV || errno == EBADF)) {
-        request_reopen();
-    }
+    if (release_fence_fd >= 0) close(release_fence_fd);
+    if (rc < 0 && (errno == ENODEV || errno == EBADF)) request_reopen();
     return rc;
 }
 
@@ -683,21 +688,26 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
-    struct { int id; int display_id; } ex = { -1, 0 };
+    drm_evdi_swap ex;
     std::memset(&ex, 0, sizeof(ex));
     ex.id = -1;
     ex.display_id = 0;
+    ex.acquire_fence_fd = -1;
     uint32_t numTypes = 0;
     uint32_t numRequests = 0;
     hwc2_error_t error = HWC2_ERROR_NONE;
     memcpy(&ex, data, sizeof(ex));
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
+    const int acquire_fd = ex.acquire_fence_fd;
 
     struct SwapReplyGuard {
         int poll_id;
+        int release_fence_fd = -1;
         bool replied = false;
-        ~SwapReplyGuard() { if (!replied) (void)evdi_swap_reply(poll_id); }
+        ~SwapReplyGuard() {
+            if (!replied) (void)evdi_swap_reply_with_release_fence(poll_id, release_fence_fd);
+        }
     } reply{poll_id};
 
     hwc2_compat_display_t* hwcDisp = nullptr;
@@ -748,14 +758,35 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     error = hwc2_compat_display_set_client_target(hwcDisp,
                                                  slot,
                                                  rwb.get(),
-                                                 -1,
+                                                 acquire_fd,
                                                  HAL_DATASPACE_UNKNOWN);
     if (error != HWC2_ERROR_NONE) {
         fprintf(stderr, "set_client_target failed: %d\n", (int)error);
+        if (acquire_fd >= 0) close(acquire_fd);
     }
 
-    if (evdi_swap_reply(poll_id) == 0)
+    error = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
+    if (error == HWC2_ERROR_HAS_CHANGES) {
+        (void)hwc2_compat_display_accept_changes(hwcDisp);
+        error = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
+    }
+    if (error != HWC2_ERROR_NONE) {
+        fprintf(stderr, "validate failed: %d\n", (int)error);
+    }
+
+    int present_fence_fd = -1;
+    error = hwc2_compat_display_present(hwcDisp, &present_fence_fd);
+    if (error != HWC2_ERROR_NONE) {
+        fprintf(stderr, "present failed: %d\n", (int)error);
+        if (present_fence_fd >= 0) close(present_fence_fd);
+        present_fence_fd = -1;
+    }
+
+    reply.release_fence_fd = present_fence_fd;
+    if (evdi_swap_reply_with_release_fence(poll_id, reply.release_fence_fd) == 0) {
+        reply.release_fence_fd = -1;
         reply.replied = true;
+    }
 
     return;
 }
