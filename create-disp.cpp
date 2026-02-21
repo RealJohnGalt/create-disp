@@ -701,6 +701,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     const int drv_display_id = ex.display_id;
     const int acquire_fd = ex.acquire_fence_fd;
 
+    printf("acquire_fd: %d\n", acquire_fd);
+
     struct SwapReplyGuard {
         int poll_id;
         int release_fence_fd = -1;
