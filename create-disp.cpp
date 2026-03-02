@@ -125,6 +125,10 @@ static std::condition_variable g_present_cv;
 static std::deque<struct PresentJob> g_present_q;
 static std::thread g_present_thread;
 
+static std::mutex g_vsync_mutex;
+static std::condition_variable g_vsync_cv;
+static bool g_vsync_fired[kMaxDriverDisplays] = {false};
+
 static constexpr int kShutdownKickSignal = SIGUSR1;
 
 int drm_fd;
@@ -482,6 +486,17 @@ static void present_thread_main()
         if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests))
             (void)hwc2_compat_display_accept_changes(hwcDisp);
 
+        {
+            std::unique_lock<std::mutex> vlk(g_vsync_mutex);
+            g_vsync_fired[j.drv_display_id] = false;
+
+            g_vsync_cv.wait_for(vlk, std::chrono::milliseconds(100), [&]{
+                return g_vsync_fired[j.drv_display_id] || !g_running.load(std::memory_order_acquire);
+            });
+        }
+
+        if (!g_running.load(std::memory_order_acquire)) break;
+
         int presentFence = -1;
         err = hwc2_compat_display_present(hwcDisp, &presentFence);
         if (err != HWC2_ERROR_NONE) {
@@ -625,6 +640,11 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
             fprintf(stderr, "vsync failed for display %d: %d (%s)\n",
                     drv_id, errno, strerror(errno));
         }
+        {
+            std::lock_guard<std::mutex> lk(g_vsync_mutex);
+            g_vsync_fired[drv_id] = true;
+        }
+        g_vsync_cv.notify_all();
     }
 }
 
@@ -1308,6 +1328,7 @@ int main() {
 
     g_update_cv.notify_all();
     g_present_cv.notify_all();
+    g_vsync_cv.notify_all();
 
     if (g_poll_thread.joinable())
         kick_thread_out_of_ioctl(g_poll_thread);
