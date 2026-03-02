@@ -305,6 +305,8 @@ struct BufferEntry {
     int rwb_h = 0;
     uint32_t rwb_stride = 0;
     uint32_t stride_px = 0;
+    int width = 0;
+    int height = 0;
     uint32_t assigned_slot = std::numeric_limits<uint32_t>::max();
     ~BufferEntry() {
         rwb.reset();
@@ -312,6 +314,8 @@ struct BufferEntry {
             for (int i = 0; i < handle->numFds; i++)
                 close(handle->data[i]);
             free(handle);
+        } else if (origin == BufferOrigin::Allocated && handle) {
+            hybris_gralloc_release(handle, 1);
         }
     }
 };
@@ -426,6 +430,8 @@ struct PresentJob {
     uint32_t slot = 0;
     std::shared_ptr<BufferEntry> entry;
     SharedRwb rwb;
+    int crop_w = 0;
+    int crop_h = 0;
 };
 
 static inline void enqueue_present_job(PresentJob&& j)
@@ -459,10 +465,12 @@ static void present_thread_main()
         }
 
         hwc2_compat_display_t* hwcDisp = nullptr;
+        hwc2_compat_layer_t* hwcLayer = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
             Display& D = get_or_create_display(j.drv_display_id);
             hwcDisp = D.hwcDisplay;
+            hwcLayer = D.layer;
         }
         if (!hwcDisp || !j.rwb)
             continue;
@@ -474,6 +482,12 @@ static void present_thread_main()
         hwc2_error_t err = HWC2_ERROR_NONE;
 
         ScopedHwcLock hwclk(j.drv_display_id);
+
+        if (hwcDisp && hwcLayer && j.crop_w > 0 && j.crop_h > 0) {
+            hwc2_compat_layer_set_source_crop(hwcLayer, 0.0f, 0.0f, j.crop_w, j.crop_h);
+            hwc2_compat_layer_set_display_frame(hwcLayer, 0, 0, j.crop_w, j.crop_h);
+            hwc2_compat_layer_set_visible_region(hwcLayer, 0, 0, j.crop_w, j.crop_h);
+        }
 
         err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                     -1, HAL_DATASPACE_UNKNOWN);
@@ -784,6 +798,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     std::shared_ptr<BufferEntry> entry;
     SharedRwb rwb;
     uint32_t slot = 0;
+    int crop_w = 0;
+    int crop_h = 0;
 
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
@@ -822,17 +838,21 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     // Check RWB matches display geometry
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        const uint32_t buf_stride = (entry->stride_px != 0) ? entry->stride_px : Dsnap.stride;
+        const uint32_t buf_w = (entry->width != 0) ? entry->width : Dsnap.width;
+        const uint32_t buf_h = (entry->height != 0) ? entry->height : Dsnap.height;
+        const uint32_t buf_stride = entry->stride_px;
         if (!entry->rwb ||
-            entry->rwb_w != Dsnap.width || entry->rwb_h != Dsnap.height || entry->rwb_stride != buf_stride) {
-            entry->rwb = make_rwb(Dsnap.width, Dsnap.height, buf_stride,
+            entry->rwb_w != buf_w || entry->rwb_h != buf_h || entry->rwb_stride != buf_stride) {
+            entry->rwb = make_rwb(buf_w, buf_h, buf_stride,
                                   HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage,
                                   entry->handle);
-            entry->rwb_w = Dsnap.width;
-            entry->rwb_h = Dsnap.height;
+            entry->rwb_w = buf_w;
+            entry->rwb_h = buf_h;
             entry->rwb_stride = buf_stride;
         }
         rwb = entry->rwb;
+        crop_w = buf_w;
+        crop_h = buf_h;
     }
 
     if (unlikely(!rwb)) {
@@ -847,6 +867,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     j.slot = slot;
     j.entry = std::move(entry);
     j.rwb = std::move(rwb);
+    j.crop_w = crop_w;
+    j.crop_h = crop_h;
     enqueue_present_job(std::move(j));
     return;
 }
@@ -867,13 +889,18 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
 
 
 void create_buff(void *data, int poll_id, int drm_fd) {
-//printf("Hi from create_buff\n");
     struct drm_evdi_gbm_create_buff buff_params;
     struct drm_evdi_create_buff_callabck cmd;
     memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
+
     const native_handle_t *full_handle;
-    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888,
-                                      kRwbUsage, (buffer_handle_t*)&full_handle, &cmd.stride);
+
+    int ret = hybris_gralloc_allocate(buff_params.width,
+                                      buff_params.height,
+                                      HAL_PIXEL_FORMAT_RGBA_8888,
+                                      kRwbUsage,
+                                      (buffer_handle_t*)&full_handle,
+                                      &cmd.stride);
     if (ret != 0) {
         fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
         cmd.id = -1;
@@ -891,6 +918,8 @@ void create_buff(void *data, int poll_id, int drm_fd) {
         auto it = g_buffers.find(cmd.id);
         if (it != g_buffers.end() && it->second) {
             it->second->stride_px = cmd.stride;
+            it->second->width = buff_params.width;
+            it->second->height = buff_params.height;
         }
     }
 }
