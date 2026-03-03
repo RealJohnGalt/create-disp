@@ -31,6 +31,7 @@
 #include <condition_variable>
 
 #include <systemd/sd-daemon.h>
+#include <linux/dma-buf.h>
 
 #include <hybris/hwc2/hwc2_compatibility_layer.h>
 #include <hybris/gralloc/gralloc.h>
@@ -439,6 +440,17 @@ static inline void enqueue_present_job(PresentJob&& j)
     g_present_cv.notify_one();
 }
 
+static void wait_for_buffer(native_handle_t* handle) {
+    if (!handle || handle->numFds < 1) return;
+    
+    int dma_buf_fd = handle->data[0];
+    
+    struct dma_buf_sync sync = { 0 };
+    sync.flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START;
+    
+    (void)ioctl(dma_buf_fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
 static void present_thread_main()
 {
     while (g_running.load(std::memory_order_acquire)) {
@@ -471,8 +483,13 @@ static void present_thread_main()
 
         ScopedHwcLock hwclk(j.drv_display_id);
 
+        if (j.entry && j.entry->handle) {
+            wait_for_buffer(j.entry->handle);
+        }
+
         err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                     -1, HAL_DATASPACE_UNKNOWN);
+
         if (err != HWC2_ERROR_NONE)
             fprintf(stderr, "set_client_target failed: %d\n", (int)err);
 
