@@ -304,7 +304,6 @@ struct BufferEntry {
     int rwb_w = 0;
     int rwb_h = 0;
     uint32_t rwb_stride = 0;
-    uint32_t stride_px = 0;
     int width = 0;
     int height = 0;
     uint32_t assigned_slot = std::numeric_limits<uint32_t>::max();
@@ -840,7 +839,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         const uint32_t buf_w = (entry->width != 0) ? entry->width : Dsnap.width;
         const uint32_t buf_h = (entry->height != 0) ? entry->height : Dsnap.height;
-        const uint32_t buf_stride = entry->stride_px;
+        const uint32_t buf_stride = buf_w;
         if (!entry->rwb ||
             entry->rwb_w != buf_w || entry->rwb_h != buf_h || entry->rwb_stride != buf_stride) {
             entry->rwb = make_rwb(buf_w, buf_h, buf_stride,
@@ -917,7 +916,6 @@ void create_buff(void *data, int poll_id, int drm_fd) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         auto it = g_buffers.find(cmd.id);
         if (it != g_buffers.end() && it->second) {
-            it->second->stride_px = cmd.stride;
             it->second->width = buff_params.width;
             it->second->height = buff_params.height;
         }
