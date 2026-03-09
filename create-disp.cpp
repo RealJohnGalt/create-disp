@@ -153,7 +153,6 @@ static inline int drm_ioctl(unsigned long req, void *arg)
 }
 
 static inline void request_display_resync(int drv_display_id);
-static inline void request_all_connected_resync();
 
 static inline void schedule_update(int drv_display_id)
 {
@@ -352,30 +351,6 @@ static inline void request_display_resync(int drv_display_id)
     schedule_update(drv_display_id);
 }
 
-static inline void request_all_connected_resync()
-{
-    std::array<int, kMaxDriverDisplays> ids{};
-    size_t count = 0;
-
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        for (const auto& kv : g_displays) {
-            const int drv_id = kv.first;
-            const Display& D = kv.second;
-            if (!D.connected)
-                continue;
-            bool expected = false;
-            if (g_resync_pending[drv_id].compare_exchange_strong(
-                   expected, true, std::memory_order_acq_rel)) {
-                ids[count++] = drv_id;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < count; ++i)
-        schedule_update(ids[i]);
-}
-
 enum class BufferOrigin : uint8_t {
     Imported = 0,
     Allocated = 1,
@@ -398,7 +373,6 @@ struct BufferEntry {
     int display_id = -1;
     uint64_t generation = 0;
     bool generation_bound = false;
-    bool retired = false;
 
     ~BufferEntry() {
         rwb.reset();
@@ -428,7 +402,7 @@ static inline void erase_buffer_locked(int buf_id)
     }
 }
 
-static inline void retire_buffer_locked(int buf_id)
+static inline void clear_buffer_binding_locked(int buf_id)
 {
     auto it = g_buffers.find(buf_id);
     if (it == g_buffers.end())
@@ -437,13 +411,6 @@ static inline void retire_buffer_locked(int buf_id)
     std::shared_ptr<BufferEntry> entry = it->second;
     if (!entry)
         return;
-
-    entry->retired = true;
-    entry->rwb.reset();
-    entry->rwb_w = 0;
-    entry->rwb_h = 0;
-    entry->rwb_stride = 0;
-    entry->rwb_format = 0;
 
     if (entry->display_id >= 0 && entry->display_id < kMaxDriverDisplays) {
         auto dit = g_displays.find(entry->display_id);
@@ -457,6 +424,15 @@ static inline void retire_buffer_locked(int buf_id)
             kv.second.live_buf_ids.erase(buf_id);
         }
     }
+
+    entry->display_id = -1;
+    entry->generation = 0;
+    entry->generation_bound = false;
+    entry->rwb.reset();
+    entry->rwb_w = 0;
+    entry->rwb_h = 0;
+    entry->rwb_stride = 0;
+    entry->rwb_format = 0;
 }
 
 static inline void invalidate_display_buffers_locked(int drv_display_id)
@@ -467,19 +443,12 @@ static inline void invalidate_display_buffers_locked(int drv_display_id)
         return;
     }
 
-    std::vector<int> doomed;
-    doomed.reserve(D.live_buf_ids.size());
-    for (int buf_id : D.live_buf_ids)
-        doomed.push_back(buf_id);
-
-    D.live_buf_ids.clear();
-    for (int buf_id : doomed)
-        retire_buffer_locked(buf_id);
-
+    std::unordered_set<int> doomed;
+    doomed.swap(D.live_buf_ids);
     D.slot_mgr.reset();
 
     for (int buf_id : doomed)
-        g_buffers.erase(buf_id);
+        clear_buffer_binding_locked(buf_id);
 }
 
 static constexpr size_t kExpectedHandles = 4096;
@@ -930,12 +899,10 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 
     std::shared_ptr<BufferEntry> entry;
     native_handle_t* handle = nullptr;
-    bool unavailable = false;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         entry = get_entry_locked_nolock(id);
-        unavailable = (!entry || !entry->handle || entry->retired);
-        handle = unavailable ? nullptr : entry->handle;
+        handle = (entry && entry->handle) ? entry->handle : nullptr;
     }
 
     if (!handle) {
@@ -944,7 +911,7 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
         cmd.numInts = -1;
         cmd.fd_ints   = nullptr;
         cmd.data_ints = nullptr;
-        request_all_connected_resync();
+        fprintf(stderr, "Ignoring unavailable get_buf: %d\n", id);
     } else {
         cmd.version = handle->version;
         cmd.numFds  = handle->numFds;
@@ -983,9 +950,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         entry = get_entry_locked_nolock(id);
-        if (!entry || !entry->handle || entry->retired) {
-            fprintf(stderr, "Ignoring unavailable/retired buf: %d\n", id);
-            request_display_resync(drv_display_id);
+        if (!entry || !entry->handle) {
+            fprintf(stderr, "Ignoring unavailable buf: %d\n", id);
             return;
         }
         Dsnap = snapshot_display_locked(drv_display_id);
@@ -1003,39 +969,38 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         Display& D = get_or_create_display(drv_display_id);
 
-        if (!D.connected || !D.hwcDisplay || D.generation != Dsnap.generation) {
-            request_display_resync(drv_display_id);
+        if (!D.connected || !D.hwcDisplay || D.generation != Dsnap.generation)
             return;
-        }
 
-        if (!entry || !entry->handle || entry->retired) {
-            request_display_resync(drv_display_id);
+        if (!entry || !entry->handle)
+            return;
+
+        if (entry->generation_bound &&
+            (entry->display_id != drv_display_id || entry->generation != Dsnap.generation)) {
+            clear_buffer_binding_locked(id);
+            fprintf(stderr,
+                    "Dropping stale generation-bound buf id=%d for display=%d (buf gen=%" PRIu64 ", display gen=%" PRIu64 ")\n",
+                    id, drv_display_id, entry->generation, Dsnap.generation);
             return;
         }
 
         if (!entry->generation_bound) {
-            if ((entry->width  != 0 && entry->width  != Dsnap.width) ||
-                (entry->height != 0 && entry->height != Dsnap.height)) {
+            if (entry->origin == BufferOrigin::Imported &&
+                (entry->width  != 0 && entry->width  != Dsnap.width ||
+                 entry->height != 0 && entry->height != Dsnap.height)) {
                 fprintf(stderr,
-                        "Dropping mismatched first-use buffer id=%d for display=%d "
+                        "Skipping mismatched buffer id=%d for display=%d "
                         "(buf=%dx%d, display=%dx%d)\n",
                         id, drv_display_id,
                         entry->width, entry->height,
                         Dsnap.width, Dsnap.height);
-                retire_buffer_locked(id);
-                request_display_resync(drv_display_id);
+                clear_buffer_binding_locked(id);
                 return;
             }
             entry->generation_bound = true;
             entry->generation = Dsnap.generation;
             entry->display_id = drv_display_id;
             D.live_buf_ids.insert(id);
-        } else if (entry->display_id != drv_display_id || entry->generation != Dsnap.generation) {
-            fprintf(stderr, "Dropping stale buffer id=%d for display=%d (buf gen=%" PRIu64 ", display gen=%" PRIu64 ")\n",
-                    id, drv_display_id, entry->generation, Dsnap.generation);
-            retire_buffer_locked(id);
-            request_display_resync(drv_display_id);
-            return;
         }
 
         slot = D.slot_mgr.assign(id);
@@ -1068,7 +1033,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         if (buf_stride == 0 || buf_w <= 0 || buf_h <= 0) {
             fprintf(stderr, "Invalid buffer geometry for id=%d (origin=%d, w=%d, h=%d, stride=%u)\n",
                     id, (int)entry->origin, buf_w, buf_h, buf_stride);
-            request_display_resync(drv_display_id);
+            if (entry->origin == BufferOrigin::Imported)
+                clear_buffer_binding_locked(id);
             return;
         }
 
