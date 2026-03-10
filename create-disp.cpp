@@ -12,7 +12,6 @@
 #include <cassert>
 #include <unordered_map>
 #include <map>
-#include <vector>
 #include <new>
 #include <fstream>
 #include <poll.h>
@@ -83,7 +82,9 @@ struct drm_evdi_vsync {
 static const int kMaxDriverDisplays = 5;
 static std::unordered_map<long long, int> g_hwc_to_drv;
 static std::unordered_map<int, long long> g_drv_to_hwc;
-static std::vector<int> g_free_drv_ids;
+static std::array<int, kMaxDriverDisplays> g_free_drv_ids = {};
+static int g_free_drv_count = 0;
+static bool g_free_drv_ids_initialized = false;
 static std::atomic<bool> drm_ready{false};
 static std::array<std::atomic<bool>, kMaxDriverDisplays> g_resync_pending{};
 
@@ -444,7 +445,7 @@ static inline void reset_display_bindings_locked(int drv_display_id)
         const std::shared_ptr<BufferEntry>& entry = kv.second;
         if (!entry)
             continue;
-        if (entry->display_id == drv_display_id || entry->generation != 0)
+        if (entry->display_id == drv_display_id)
             reset_buffer_binding_locked(entry);
     }
     D.slot_mgr.reset();
@@ -597,6 +598,21 @@ static inline void flush_present_jobs_for_display(int drv_display_id)
     }
 }
 
+static inline hwc2_compat_display_t*
+refresh_hwc_display_locked(int drv_display_id)
+{
+    Display& D = get_or_create_display(drv_display_id);
+    if (!D.connected || D.hwc_id == 0)
+        return nullptr;
+
+    hwc2_compat_display_t* live =
+        hwc2_compat_device_get_display_by_id(
+            hwcDevice, (hwc2_display_t)D.hwc_id);
+    if (live)
+        D.hwcDisplay = live;
+    return D.hwcDisplay;
+}
+
 static void present_thread_main()
 {
     while (g_running.load(std::memory_order_acquire)) {
@@ -620,13 +636,15 @@ static void present_thread_main()
             std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
             std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id], std::defer_lock);
             std::lock(state_lk, hwc_lk);
+
             Display& D = get_or_create_display(j.drv_display_id);
-            if (!D.connected || !D.hwcDisplay || D.generation != j.generation)
+            hwcDisp = D.hwcDisplay
+                ? D.hwcDisplay
+                : refresh_hwc_display_locked(j.drv_display_id);
+            if (!D.connected || !hwcDisp || D.generation != j.generation)
                 continue;
-            hwcDisp = D.hwcDisplay;
 
             state_lk.unlock();
-
             uint32_t numTypes = 0, numRequests = 0;
             hwc2_error_t err = HWC2_ERROR_NONE;
 
@@ -666,11 +684,12 @@ static void present_thread_main()
 }
 
 static inline void init_free_driver_slots_once() {
-    if (!g_free_drv_ids.empty()) return;
-    g_free_drv_ids.reserve(kMaxDriverDisplays);
-    for (int i = kMaxDriverDisplays - 1; i >= 0; --i) {
-        g_free_drv_ids.push_back(i);
-    }
+    if (g_free_drv_ids_initialized)
+        return;
+    g_free_drv_count = 0;
+    for (int i = kMaxDriverDisplays - 1; i >= 0; --i)
+        g_free_drv_ids[g_free_drv_count++] = i;
+    g_free_drv_ids_initialized = true;
 }
 
 bool is_evdi_lindroid(int fd) {
@@ -684,41 +703,39 @@ bool is_evdi_lindroid(int fd) {
 }
 
 int find_evdi_lindroid_device() {
-    const std::string dri_path = "/dev/dri/";
-    std::vector<std::string> candidates;
+    static const char* dri_path = "/dev/dri/";
+    DIR* dir = opendir(dri_path);
+    if (!dir)
+        return -1;
 
-    if (DIR* dir = opendir(dri_path.c_str())) {
-        struct dirent* entry;
-        while ((entry = readdir(dir)) != nullptr) {
-            if (strncmp(entry->d_name, "card", 4) == 0) {
-                candidates.emplace_back(dri_path + entry->d_name);
-            }
-        }
-        closedir(dir);
-    }
+    int found_fd = -1;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strncmp(entry->d_name, "card", 4) != 0)
+            continue;
 
-    for (const auto& path : candidates) {
+        std::string path = std::string(dri_path) + entry->d_name;
         int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
         if (fd < 0) continue;
 
-        if (is_evdi_lindroid(fd)) {
-            std::cout << "Found evdi-lindroid at " << path << std::endl;
-
-            if (drmIsMaster(fd)) {
-                if (ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
-                    std::cerr << "Failed to drop master on " << path << ": " << strerror(errno) << std::endl;
-                    close(fd);
-                    return -1;
-                }
-            }
-
-            return fd;
+        if (!is_evdi_lindroid(fd)) {
+            close(fd);
+            continue;
         }
 
-        close(fd);
+        std::cout << "Found evdi-lindroid at " << path << std::endl;
+        if (drmIsMaster(fd)) {
+            if (ioctl(fd, DRM_IOCTL_DROP_MASTER, nullptr) < 0) {
+                std::cerr << "Failed to drop master on " << path << ": " << strerror(errno) << std::endl;
+                close(fd);
+                break;
+            }
+        }
+        found_fd = fd;
+        break;
     }
-
-    return -1;
+    closedir(dir);
+    return found_fd;
 }
 
 int open_evdi_lindroid_or_create() {
@@ -824,9 +841,8 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
 static inline int alloc_driver_slot_for_hwc(long long hwc_id) {
     int drv = drv_id_for_hwc(hwc_id);
     if (drv >= 0) return drv;
-    if (g_free_drv_ids.empty()) return -1;
-    drv = g_free_drv_ids.back();
-    g_free_drv_ids.pop_back();
+    if (g_free_drv_count <= 0) return -1;
+    drv = g_free_drv_ids[--g_free_drv_count];
     g_hwc_to_drv[hwc_id] = drv;
     g_drv_to_hwc[drv] = hwc_id;
     return drv;
@@ -838,7 +854,16 @@ static inline void release_driver_slot_for_hwc(long long hwc_id) {
     int drv = it->second;
     g_hwc_to_drv.erase(it);
     g_drv_to_hwc.erase(drv);
-    g_free_drv_ids.push_back(drv);
+
+    for (int i = 0; i < g_free_drv_count; ++i) {
+        if (g_free_drv_ids[i] == drv)
+            return;
+    }
+
+    if (g_free_drv_count < kMaxDriverDisplays)
+        g_free_drv_ids[g_free_drv_count++] = drv;
+    else
+        fprintf(stderr, "release_driver_slot_for_hwc: free list overflow for drv %d\n", drv);
 }
 
 void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
@@ -932,13 +957,10 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 
     std::shared_ptr<BufferEntry> entry;
     native_handle_t* handle = nullptr;
-    int resync_display_id = -1;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         entry = get_entry_locked_nolock(id);
         handle = (entry && entry->handle) ? entry->handle : nullptr;
-        if (entry && entry->display_id >= 0 && entry->display_id < kMaxDriverDisplays)
-            resync_display_id = entry->display_id;
     }
 
     if (!handle) {
@@ -947,15 +969,6 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
         cmd.numInts = -1;
         cmd.fd_ints   = nullptr;
         cmd.data_ints = nullptr;
-        if (resync_display_id >= 0) {
-            DisplaySnapshot Dsnap;
-            {
-                std::lock_guard<std::mutex> lk(g_state_mutex);
-                Dsnap = snapshot_display_locked(resync_display_id);
-            }
-            if (Dsnap.connected && Dsnap.hwcDisplay)
-                request_display_resync(resync_display_id);
-        }
     } else {
         cmd.version = handle->version;
         cmd.numFds  = handle->numFds;
@@ -990,26 +1003,26 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         entry = get_entry_locked_nolock(id);
         if (!entry || !entry->handle) {
-            fprintf(stderr, "Ignoring unavailable buf: %d\n", id);
-            Dsnap = snapshot_display_locked(drv_display_id);
-            if (Dsnap.connected && Dsnap.hwcDisplay) {
-                request_display_resync(drv_display_id);
-            }
+            request_display_resync(drv_display_id);
             return;
         }
+
         Dsnap = snapshot_display_locked(drv_display_id);
         hwcDisp = Dsnap.hwcDisplay;
     }
 
-    if (unlikely(!hwcDisp || !Dsnap.connected ||
-                 Dsnap.width == 0 || Dsnap.height == 0 || Dsnap.stride == 0)) {
-        printf("Display %d not ready (no HWC or size)\n", drv_display_id);
+    if (unlikely(!hwcDisp || !Dsnap.connected)) {
         request_display_resync(drv_display_id);
         return;
     }
 
+    if (unlikely(Dsnap.width == 0 || Dsnap.height == 0 || Dsnap.stride == 0)) {
+        request_display_resync(drv_display_id);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
+
         Display& D = get_or_create_display(drv_display_id);
 
         if (!D.connected || !D.hwcDisplay || D.generation != Dsnap.generation) {
@@ -1022,11 +1035,23 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
             return;
         }
 
+        if (entry->generation != 0 && entry->generation != Dsnap.generation) {
+            request_display_resync(drv_display_id);
+            return;
+        }
+
+        if (entry->display_id >= 0 &&
+            entry->display_id != drv_display_id &&
+            entry->generation == Dsnap.generation) {
+            request_display_resync(drv_display_id);
+            return;
+        }
+
         if (entry->display_id != drv_display_id || entry->generation != Dsnap.generation) {
             if ((entry->width  != 0 && entry->width  != Dsnap.width) ||
                 (entry->height != 0 && entry->height != Dsnap.height)) {
                 fprintf(stderr,
-                        "Dropping mismatched buffer id=%d for display=%d "
+                        "Dropping stale/mismatched buffer id=%d for display=%d "
                         "(buf=%dx%d, display=%dx%d)\n",
                         id, drv_display_id,
                         entry->width, entry->height,
@@ -1211,10 +1236,14 @@ int update_display(int display_id) {
         std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[display_id], std::defer_lock);
         std::lock(state_lk, hwc_lk);
         Display& D = get_or_create_display(display_id);
-        if (!D.connected || !D.hwcDisplay)
+        hwc2_compat_display_t* hwcDisp =
+            D.hwcDisplay ? D.hwcDisplay
+                         : refresh_hwc_display_locked(display_id);
+        if (!D.connected || !hwcDisp)
             return -1;
 
-        HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(D.hwcDisplay);
+        HWC2DisplayConfig* config =
+            hwc2_compat_display_get_active_config(hwcDisp);
         if (!config) {
             fprintf(stderr, "update_display(%d): no active HWC config yet, will retry on next refresh\n",
                     display_id);
@@ -1401,7 +1430,8 @@ static void poll_thread_main()
             hard_poll_failures = 0;
 
             if (drm_ready.load(std::memory_order_acquire)) {
-                std::vector<int> reconnect_displays;
+                std::array<int, kMaxDriverDisplays> reconnect_displays = {};
+                int reconnect_count = 0;
                 {
                     std::lock_guard<std::mutex> slk(g_state_mutex);
                     for (auto &kv : g_displays) {
@@ -1411,12 +1441,13 @@ static void poll_thread_main()
                             kv.second.height = 0;
                             kv.second.stride = 0;
                             g_resync_pending[kv.first].store(true, std::memory_order_release);
-                            reconnect_displays.push_back(kv.first);
+                            if (reconnect_count < kMaxDriverDisplays)
+                                reconnect_displays[reconnect_count++] = kv.first;
                         }
                     }
                 }
-                for (int disp_id : reconnect_displays)
-                    schedule_update(disp_id);
+                for (int i = 0; i < reconnect_count; ++i)
+                    schedule_update(reconnect_displays[i]);
             }
         }
 
