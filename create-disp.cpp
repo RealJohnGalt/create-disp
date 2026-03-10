@@ -868,10 +868,13 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     cmd.poll_id = poll_id;
 
     native_handle_t* handle = nullptr;
+    int resync_display_id = -1;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         std::shared_ptr<BufferEntry> entry = get_entry_locked_nolock(id);
         handle = (entry && entry->handle) ? entry->handle : nullptr;
+        if (entry && entry->display_id >= 0 && entry->display_id < kMaxDriverDisplays)
+            resync_display_id = entry->display_id;
     }
 
     if (!handle) {
@@ -880,6 +883,15 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
         cmd.numInts = -1;
         cmd.fd_ints   = nullptr;
         cmd.data_ints = nullptr;
+        if (resync_display_id >= 0) {
+            DisplaySnapshot Dsnap;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mutex);
+                Dsnap = snapshot_display_locked(resync_display_id);
+            }
+            if (Dsnap.connected && Dsnap.hwcDisplay)
+                request_display_resync(resync_display_id);
+        }
     } else {
         cmd.version = handle->version;
         cmd.numFds  = handle->numFds;
@@ -1082,6 +1094,23 @@ static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg
 {
     return hz_from_period_ns(cfg->vsyncPeriod);
 }
+
+static inline int reconnect_display_mode(int display_id,
+                                         int target_width,
+                                         int target_height,
+                                         int refresh_hz,
+                                         bool disconnect_first)
+{
+    if (disconnect_first) {
+        if (evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)display_id, 0) < 0)
+            return -1;
+    }
+
+    return evdi_connect(drm_fd, 0,
+                        (uint32_t)target_width, (uint32_t)target_height,
+                        (uint32_t)refresh_hz, (uint32_t)display_id, 1);
+}
+
 int update_display(int display_id) {
     if (display_id < 0 || display_id >= kMaxDriverDisplays)
         return -1;
@@ -1097,8 +1126,10 @@ int update_display(int display_id) {
     int target_height = 0;
     int refresh_hz = 60;
     uint64_t generation = 0;
-
     uint32_t new_stride = 0;
+    bool force_reconnect = g_resync_pending[display_id].load(std::memory_order_acquire);
+    bool had_previous_mode = false;
+    bool mode_changed = false;
 
     {
         std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
@@ -1124,12 +1155,15 @@ int update_display(int display_id) {
         target_width = config->width;
         target_height = config->height;
         refresh_hz = get_refresh_hz_from_active_config(config);
-        if (D.width == target_width && D.height == target_height && D.stride != 0)
+        had_previous_mode = (D.width > 0 && D.height > 0 && D.stride != 0);
+        mode_changed = (D.width != target_width || D.height != target_height);
+
+        if (!force_reconnect && !mode_changed && D.stride != 0)
             return 0;
 
         printf("display %d width: %i height: %i\n", display_id, target_width, target_height);
 
-	reset_display_bindings_locked(display_id);
+        reset_display_bindings_locked(display_id);
 
         D.generation++;
         generation = D.generation;
@@ -1154,9 +1188,9 @@ int update_display(int display_id) {
         << "@" << refresh_hz << "Hz 'Lindroid display " << display_id << "'";
     std::cout << oss.str() << std::endl;
 
-    if (evdi_connect(drm_fd, 0,
-                     (uint32_t)target_width, (uint32_t)target_height,
-                     (uint32_t)refresh_hz, (uint32_t)display_id, 1) < 0) {
+    if (reconnect_display_mode(display_id,
+                               target_width, target_height, refresh_hz,
+                               force_reconnect || mode_changed || had_previous_mode) < 0) {
         return EXIT_FAILURE;
     }
     bool committed = false;
