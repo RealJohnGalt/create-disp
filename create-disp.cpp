@@ -598,21 +598,6 @@ static inline void flush_present_jobs_for_display(int drv_display_id)
     }
 }
 
-static inline hwc2_compat_display_t*
-refresh_hwc_display_locked(int drv_display_id)
-{
-    Display& D = get_or_create_display(drv_display_id);
-    if (!D.connected || D.hwc_id == 0)
-        return nullptr;
-
-    hwc2_compat_display_t* live =
-        hwc2_compat_device_get_display_by_id(
-            hwcDevice, (hwc2_display_t)D.hwc_id);
-    if (live)
-        D.hwcDisplay = live;
-    return D.hwcDisplay;
-}
-
 static void present_thread_main()
 {
     while (g_running.load(std::memory_order_acquire)) {
@@ -638,9 +623,7 @@ static void present_thread_main()
             std::lock(state_lk, hwc_lk);
 
             Display& D = get_or_create_display(j.drv_display_id);
-            hwcDisp = D.hwcDisplay
-                ? D.hwcDisplay
-                : refresh_hwc_display_locked(j.drv_display_id);
+            hwcDisp = D.hwcDisplay;
             if (!D.connected || !hwcDisp || D.generation != j.generation)
                 continue;
 
@@ -1236,9 +1219,7 @@ int update_display(int display_id) {
         std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[display_id], std::defer_lock);
         std::lock(state_lk, hwc_lk);
         Display& D = get_or_create_display(display_id);
-        hwc2_compat_display_t* hwcDisp =
-            D.hwcDisplay ? D.hwcDisplay
-                         : refresh_hwc_display_locked(display_id);
+        hwc2_compat_display_t* hwcDisp = D.hwcDisplay;
         if (!D.connected || !hwcDisp)
             return -1;
 
