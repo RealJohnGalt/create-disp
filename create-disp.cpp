@@ -11,7 +11,6 @@
 #include <memory>
 #include <cassert>
 #include <unordered_map>
-#include <unordered_set>
 #include <map>
 #include <vector>
 #include <new>
@@ -280,7 +279,6 @@ struct Display {
     bool connected = false;
     hwc2_compat_display_t* hwcDisplay = nullptr;
     SlotManager slot_mgr;
-    std::unordered_set<int> live_buf_ids;
     uint64_t generation = 1;
 
     Display() = default;
@@ -371,8 +369,6 @@ struct BufferEntry {
     int height = 0;
     int display_id = -1;
     uint64_t generation = 0;
-    bool generation_bound = false;
-    bool retired = false;
 
     ~BufferEntry() {
         rwb.reset();
@@ -396,61 +392,33 @@ static inline void erase_buffer_locked(int buf_id)
     if (it != g_buffers.end())
         g_buffers.erase(it);
 
-    for (auto& kv : g_displays) {
+    for (auto& kv : g_displays)
         kv.second.slot_mgr.release(buf_id);
-        kv.second.live_buf_ids.erase(buf_id);
-    }
 }
 
-static inline void retire_buffer_locked(int buf_id)
+static inline void reset_buffer_binding_locked(const std::shared_ptr<BufferEntry>& entry)
 {
-    auto it = g_buffers.find(buf_id);
-    if (it == g_buffers.end())
-        return;
-
-    std::shared_ptr<BufferEntry> entry = it->second;
     if (!entry)
         return;
 
-    entry->retired = true;
+    entry->display_id = -1;
+    entry->generation = 0;
     entry->rwb.reset();
     entry->rwb_w = 0;
     entry->rwb_h = 0;
     entry->rwb_stride = 0;
     entry->rwb_format = 0;
-
-    if (entry->display_id >= 0 && entry->display_id < kMaxDriverDisplays) {
-        auto dit = g_displays.find(entry->display_id);
-        if (dit != g_displays.end()) {
-            dit->second.slot_mgr.release(buf_id);
-            dit->second.live_buf_ids.erase(buf_id);
-        }
-    } else {
-        for (auto& kv : g_displays) {
-            kv.second.slot_mgr.release(buf_id);
-            kv.second.live_buf_ids.erase(buf_id);
-        }
-    }
 }
 
-static inline void invalidate_display_buffers_locked(int drv_display_id)
+static inline void reset_display_bindings_locked(int drv_display_id)
 {
-    Display& D = get_or_create_display(drv_display_id);
-    if (D.live_buf_ids.empty()) {
-        D.slot_mgr.reset();
-        return;
+    for (auto& kv : g_buffers) {
+        const std::shared_ptr<BufferEntry>& entry = kv.second;
+        if (!entry || entry->display_id != drv_display_id)
+            continue;
+        reset_buffer_binding_locked(entry);
     }
-
-    std::vector<int> doomed;
-    doomed.reserve(D.live_buf_ids.size());
-    for (int buf_id : D.live_buf_ids)
-        doomed.push_back(buf_id);
-
-    D.live_buf_ids.clear();
-    for (int buf_id : doomed)
-        retire_buffer_locked(buf_id);
-
-    D.slot_mgr.reset();
+    get_or_create_display(drv_display_id).slot_mgr.reset();
 }
 
 static constexpr size_t kExpectedHandles = 4096;
@@ -899,19 +867,11 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     std::memset(&cmd, 0, sizeof(cmd));
     cmd.poll_id = poll_id;
 
-    std::shared_ptr<BufferEntry> entry;
     native_handle_t* handle = nullptr;
-    bool unavailable = false;
-    int resync_display_id = -1;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        entry = get_entry_locked_nolock(id);
-        unavailable = (!entry || !entry->handle || entry->retired);
-        handle = unavailable ? nullptr : entry->handle;
-        if (entry && entry->display_id >= 0 &&
-            entry->display_id < kMaxDriverDisplays) {
-            resync_display_id = entry->display_id;
-        }
+        std::shared_ptr<BufferEntry> entry = get_entry_locked_nolock(id);
+        handle = (entry && entry->handle) ? entry->handle : nullptr;
     }
 
     if (!handle) {
@@ -920,8 +880,6 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
         cmd.numInts = -1;
         cmd.fd_ints   = nullptr;
         cmd.data_ints = nullptr;
-        if (resync_display_id >= 0)
-            request_display_resync(resync_display_id);
     } else {
         cmd.version = handle->version;
         cmd.numFds  = handle->numFds;
@@ -944,9 +902,6 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     std::memset(&ex, 0, sizeof(ex));
     ex.id = -1;
     ex.display_id = 0;
-    uint32_t numTypes = 0;
-    uint32_t numRequests = 0;
-    hwc2_error_t error = HWC2_ERROR_NONE;
     memcpy(&ex, data, sizeof(ex));
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
@@ -960,8 +915,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         entry = get_entry_locked_nolock(id);
-        if (!entry || !entry->handle || entry->retired) {
-            fprintf(stderr, "Ignoring unavailable/retired buf: %d\n", id);
+        if (!entry || !entry->handle) {
+            fprintf(stderr, "Ignoring unavailable buf: %d\n", id);
             request_display_resync(drv_display_id);
             return;
         }
@@ -985,34 +940,26 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
             return;
         }
 
-        if (!entry || !entry->handle || entry->retired) {
+        if (!entry || !entry->handle) {
             request_display_resync(drv_display_id);
             return;
         }
 
-        if (!entry->generation_bound) {
+        if (entry->display_id != drv_display_id || entry->generation != Dsnap.generation) {
             if ((entry->width  != 0 && entry->width  != Dsnap.width) ||
                 (entry->height != 0 && entry->height != Dsnap.height)) {
                 fprintf(stderr,
-                        "Dropping mismatched first-use buffer id=%d for display=%d "
+                        "Dropping mismatched buffer id=%d for display=%d "
                         "(buf=%dx%d, display=%dx%d)\n",
                         id, drv_display_id,
                         entry->width, entry->height,
                         Dsnap.width, Dsnap.height);
-                retire_buffer_locked(id);
                 request_display_resync(drv_display_id);
                 return;
             }
-            entry->generation_bound = true;
-            entry->generation = Dsnap.generation;
+            reset_buffer_binding_locked(entry);
             entry->display_id = drv_display_id;
-            D.live_buf_ids.insert(id);
-        } else if (entry->display_id != drv_display_id || entry->generation != Dsnap.generation) {
-            fprintf(stderr, "Dropping stale buffer id=%d for display=%d (buf gen=%" PRIu64 ", display gen=%" PRIu64 ")\n",
-                    id, drv_display_id, entry->generation, Dsnap.generation);
-            retire_buffer_locked(id);
-            request_display_resync(drv_display_id);
-            return;
+            entry->generation = Dsnap.generation;
         }
 
         slot = D.slot_mgr.assign(id);
@@ -1182,7 +1129,7 @@ int update_display(int display_id) {
 
         printf("display %d width: %i height: %i\n", display_id, target_width, target_height);
 
-        invalidate_display_buffers_locked(display_id);
+	reset_display_bindings_locked(display_id);
 
         D.generation++;
         generation = D.generation;
@@ -1242,7 +1189,7 @@ static void disconnect_display(int drv_id)
         std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[drv_id], std::defer_lock);
         std::lock(state_lk, hwc_lk);
         Display& D = get_or_create_display(drv_id);
-        invalidate_display_buffers_locked(drv_id);
+        reset_display_bindings_locked(drv_id);
         const long long hwc_id = D.hwc_id;
         D.generation++;
         D.hwcDisplay = nullptr;
@@ -1335,7 +1282,7 @@ static void poll_thread_main()
             if (drm_ready.load(std::memory_order_acquire)) {
                 std::lock_guard<std::mutex> slk(g_state_mutex);
                 for (auto &kv : g_displays) {
-                    invalidate_display_buffers_locked(kv.first);
+                    reset_display_bindings_locked(kv.first);
                     if (kv.second.connected && kv.second.hwcDisplay) {
                         kv.second.width = 0;
                         kv.second.height = 0;
