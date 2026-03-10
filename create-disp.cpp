@@ -101,6 +101,7 @@ static bool g_enqueued[kMaxDriverDisplays] = {};
 static std::thread g_update_thread;
 
 static std::atomic<bool> g_reopen_requested{false};
+static std::atomic<int> g_modeset_inflight{0};
 
 static std::mutex g_present_mutex;
 static std::condition_variable g_present_cv;
@@ -149,6 +150,27 @@ static inline int drm_ioctl(unsigned long req, void *arg)
         return -1;
     }
     return ioctl_retry(fd, req, arg);
+}
+
+static inline bool should_request_reopen(int err)
+{
+    return (err == ENODEV || err == EBADF) &&
+           g_modeset_inflight.load(std::memory_order_acquire) == 0;
+}
+
+static inline void clear_pending_work_locked(int drv_display_id)
+{
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return;
+    g_pending_update[drv_display_id] = false;
+    g_pending_disconnect[drv_display_id] = false;
+    g_enqueued[drv_display_id] = false;
+    for (auto it = g_work_queue.begin(); it != g_work_queue.end(); ) {
+        if (*it == drv_display_id)
+            it = g_work_queue.erase(it);
+        else
+            ++it;
+    }
 }
 
 static inline void request_display_resync(int drv_display_id);
@@ -744,6 +766,28 @@ static inline int evdi_connect(int fd, int device_index,
     return 0;
 }
 
+static inline int evdi_connect_current(int device_index,
+                                       uint32_t width, uint32_t height,
+                                       uint32_t refresh_rate, uint32_t display_id,
+                                       int connected)
+{
+    drm_evdi_connect cmd = {
+        .connected = connected,
+        .dev_index = device_index,
+        .width = width,
+        .height = height,
+        .refresh_rate = refresh_rate,
+        .display_id = display_id,
+    };
+
+    if (drm_ioctl(DRM_IOCTL_EVDI_CONNECT, &cmd) < 0) {
+        perror("DRM_IOCTL_EVDI_CONNECT failed");
+        return -1;
+    }
+
+    return 0;
+}
+
 int update_display(int display_id);
 
 static inline int drv_id_for_hwc(long long hwc_id) {
@@ -905,7 +949,7 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     }
 //    printf("get_buf_from_map id: %d, version: %d\n", id, handle->version);
     int ret = drm_ioctl(DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
-    if (ret < 0 && (errno == ENODEV || errno == EBADF))
+    if (ret < 0 && should_request_reopen(errno))
         request_reopen();
 }
 
@@ -1216,7 +1260,9 @@ static void disconnect_display(int drv_id)
 
     flush_present_jobs_for_display(drv_id);
     if (drm_ready.load(std::memory_order_acquire)) {
-        (void)evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)drv_id, 0);
+        g_modeset_inflight.fetch_add(1, std::memory_order_acq_rel);
+        (void)evdi_connect_current(0, 0, 0, 0, (uint32_t)drv_id, 0);
+        g_modeset_inflight.fetch_sub(1, std::memory_order_acq_rel);
     }
     {
         std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
@@ -1340,7 +1386,8 @@ static void poll_thread_main()
                 continue;
             }
             if (errno == ENODEV || errno == EBADF) {
-                request_reopen();
+                if (should_request_reopen(errno))
+                    request_reopen();
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
             continue;
