@@ -167,9 +167,9 @@ constexpr size_t kBufferMaxSegments = 4096;
 struct SlotManager {
     static constexpr uint32_t kCapacity = 32;
 
-    std::array<int, kCapacity> slot_bufid{};
-    std::array<uint64_t, kCapacity> slot_lastused{};
-    std::array<uint8_t, kCapacity> slot_in_use{};
+    uint32_t free_mask = ~0u;
+    int slot_bufid[kCapacity]{};
+    uint64_t slot_lru_gen[kCapacity]{};
     uint64_t use_counter = 0;
 
     SlotManager();
@@ -325,8 +325,8 @@ public:
     }
 };
 
-extern std::unordered_map<long long, int> g_hwc_to_drv;
-extern std::unordered_map<int, long long> g_drv_to_hwc;
+extern std::array<long long, kMaxDriverDisplays> g_hwc_ids;
+extern std::array<bool, kMaxDriverDisplays> g_drv_slot_valid;
 extern std::array<int, kMaxDriverDisplays> g_free_drv_ids;
 extern int g_free_drv_count;
 extern bool g_free_drv_ids_initialized;
@@ -359,7 +359,8 @@ extern hwc2_compat_device_t* hwcDevice;
 extern HWC2EventListener eventListener;
 extern int drm_fd;
 
-extern std::unordered_map<int, Display> g_displays;
+extern std::array<Display, kMaxDriverDisplays> g_displays;
+extern std::array<bool, kMaxDriverDisplays> g_display_valid;
 extern std::array<DisplayRuntime, kMaxDriverDisplays> g_display_runtime;
 
 extern std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segments;
@@ -368,6 +369,18 @@ extern std::atomic<uint32_t> g_next_buffer_id;
 extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
 
 extern std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
+
+struct StrideCacheEntry {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int format = 0;
+    uint32_t stride = 0;
+    uint64_t lru_gen = 0;
+};
+extern std::array<StrideCacheEntry, 16> g_stride_cache;
+extern uint32_t g_stride_cache_size;
+extern uint64_t g_stride_cache_counter;
+extern std::mutex g_stride_cache_mutex;
 
 extern SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
 extern std::atomic<bool> g_evdi_event_thread_sleeping;

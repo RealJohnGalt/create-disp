@@ -4,15 +4,12 @@ namespace create_disp {
 
 Display& get_or_create_display(int display_id)
 {
-    auto it = g_displays.find(display_id);
-    if (it != g_displays.end()) {
-        return it->second;
+    if (display_id >= 0 && display_id < kMaxDriverDisplays) {
+        g_display_valid[display_id] = true;
+        g_displays[display_id].display_id = display_id;
+        return g_displays[display_id];
     }
-
-    auto [ins_it, inserted] = g_displays.try_emplace(display_id);
-    (void)inserted;
-    ins_it->second.display_id = display_id;
-    return ins_it->second;
+    abort();
 }
 
 void publish_display_runtime_locked(int display_id)
@@ -110,8 +107,13 @@ int drv_id_for_hwc_atomic(long long hwc_id)
 
 int drv_id_for_hwc(long long hwc_id)
 {
-    auto it = g_hwc_to_drv.find(hwc_id);
-    return it == g_hwc_to_drv.end() ? -1 : it->second;
+    if (hwc_id == 0) return -1;
+    for (int d = 0; d < kMaxDriverDisplays; ++d) {
+        if (g_drv_slot_valid[d] && g_hwc_ids[d] == hwc_id) {
+            return d;
+        }
+    }
+    return -1;
 }
 
 void init_free_driver_slots_once()
@@ -138,21 +140,26 @@ int alloc_driver_slot_for_hwc(long long hwc_id)
     }
 
     drv = g_free_drv_ids[--g_free_drv_count];
-    g_hwc_to_drv[hwc_id] = drv;
-    g_drv_to_hwc[drv] = hwc_id;
+    g_hwc_ids[drv] = hwc_id;
+    g_drv_slot_valid[drv] = true;
     return drv;
 }
 
 void release_driver_slot_for_hwc(long long hwc_id)
 {
-    auto it = g_hwc_to_drv.find(hwc_id);
-    if (it == g_hwc_to_drv.end()) {
+    int drv = -1;
+    for (int d = 0; d < kMaxDriverDisplays; ++d) {
+        if (g_drv_slot_valid[d] && g_hwc_ids[d] == hwc_id) {
+            drv = d;
+            break;
+        }
+    }
+    if (drv < 0) {
         return;
     }
 
-    int drv = it->second;
-    g_hwc_to_drv.erase(it);
-    g_drv_to_hwc.erase(drv);
+    g_hwc_ids[drv] = 0;
+    g_drv_slot_valid[drv] = false;
 
     for (int i = 0; i < g_free_drv_count; ++i) {
         if (g_free_drv_ids[i] == drv) {
@@ -519,14 +526,54 @@ int update_display(int display_id)
     }
 
     buffer_handle_t handle = nullptr;
-    int r = hybris_gralloc_allocate(target_width, target_height, HAL_PIXEL_FORMAT_RGBX_8888,
-                                    kRwbUsage, &handle, &new_stride);
-    if (r == 0 && handle) {
-        (void)hybris_gralloc_release(handle, 1);
+    int format = HAL_PIXEL_FORMAT_RGBX_8888;
+    uint32_t cached_stride = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_stride_cache_mutex);
+        for (uint32_t i = 0; i < g_stride_cache_size; ++i) {
+            if (g_stride_cache[i].width == (uint32_t)target_width &&
+                g_stride_cache[i].height == (uint32_t)target_height &&
+                g_stride_cache[i].format == format) {
+                cached_stride = g_stride_cache[i].stride;
+                g_stride_cache[i].lru_gen = ++g_stride_cache_counter;
+                break;
+            }
+        }
+    }
+
+    if (cached_stride != 0) {
+        new_stride = cached_stride;
     } else {
-        fprintf(stderr, "update_display(%d): failed to determine stride for %dx%d\n",
-                display_id, target_width, target_height);
-        return -1;
+        int r = hybris_gralloc_allocate(target_width, target_height, format,
+                                        kRwbUsage, &handle, &new_stride);
+        if (r == 0 && handle) {
+            (void)hybris_gralloc_release(handle, 1);
+        } else {
+            fprintf(stderr, "update_display(%d): failed to determine stride for %dx%d\n",
+                    display_id, target_width, target_height);
+            return -1;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_stride_cache_mutex);
+            uint32_t slot = 0;
+            uint64_t min_gen = UINT64_MAX;
+            for (uint32_t i = 0; i < g_stride_cache_size && i < 16; ++i) {
+                if (g_stride_cache[i].lru_gen < min_gen) {
+                    min_gen = g_stride_cache[i].lru_gen;
+                    slot = i;
+                }
+            }
+            g_stride_cache[slot].width = target_width;
+            g_stride_cache[slot].height = target_height;
+            g_stride_cache[slot].format = format;
+            g_stride_cache[slot].stride = new_stride;
+            g_stride_cache[slot].lru_gen = ++g_stride_cache_counter;
+            if (g_stride_cache_size < 16) {
+                g_stride_cache_size++;
+            }
+        }
     }
 
     std::ostringstream oss;

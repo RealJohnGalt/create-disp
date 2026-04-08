@@ -2,8 +2,8 @@
 
 namespace create_disp {
 
-std::unordered_map<long long, int> g_hwc_to_drv;
-std::unordered_map<int, long long> g_drv_to_hwc;
+std::array<long long, kMaxDriverDisplays> g_hwc_ids{};
+std::array<bool, kMaxDriverDisplays> g_drv_slot_valid{};
 std::array<int, kMaxDriverDisplays> g_free_drv_ids = {};
 int g_free_drv_count = 0;
 bool g_free_drv_ids_initialized = false;
@@ -35,7 +35,8 @@ std::atomic<bool> g_running{true};
 hwc2_compat_device_t* hwcDevice = nullptr;
 int drm_fd = -1;
 
-std::unordered_map<int, Display> g_displays;
+std::array<Display, kMaxDriverDisplays> g_displays{};
+std::array<bool, kMaxDriverDisplays> g_display_valid{};
 std::array<DisplayRuntime, kMaxDriverDisplays> g_display_runtime;
 
 std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segments{};
@@ -44,6 +45,11 @@ std::atomic<uint32_t> g_next_buffer_id{1};
 std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
 
 std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
+
+std::array<StrideCacheEntry, 16> g_stride_cache{};
+uint32_t g_stride_cache_size = 0;
+uint64_t g_stride_cache_counter = 0;
+std::mutex g_stride_cache_mutex;
 
 SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
 std::atomic<bool> g_evdi_event_thread_sleeping{false};
@@ -141,20 +147,16 @@ bool take_next_update_display(int& out_drv_display_id)
         return false;
     }
 
-    const int start = g_update_rr.fetch_add(1, std::memory_order_relaxed);
-    for (int i = 0; i < kMaxDriverDisplays; ++i) {
-        const int d = (start + i) % kMaxDriverDisplays;
-        const uint32_t bit = uint32_t(1) << uint32_t(d);
+    const uint32_t remaining = mask & ((1u << kMaxDriverDisplays) - 1);
+    const int start = g_update_rr.fetch_add(1, std::memory_order_relaxed) % kMaxDriverDisplays;
+    const uint32_t rotated = (remaining >> start) | (remaining << (kMaxDriverDisplays - start));
+    const int bit = __builtin_ctz(rotated);
+    const int d = (start + bit) % kMaxDriverDisplays;
 
-        if ((mask & bit) == 0) {
-            continue;
-        }
-
-        const uint32_t prev = g_update_pending_mask.fetch_and(~bit, std::memory_order_acq_rel);
-        if (prev & bit) {
-            out_drv_display_id = d;
-            return true;
-        }
+    const uint32_t prev = g_update_pending_mask.fetch_and(~(uint32_t(1) << d), std::memory_order_acq_rel);
+    if (prev & (uint32_t(1) << d)) {
+        out_drv_display_id = d;
+        return true;
     }
 
     return false;
@@ -215,20 +217,16 @@ bool take_next_present_display(int& out_drv_display_id)
         return false;
     }
 
-    const int start = g_present_rr.fetch_add(1, std::memory_order_relaxed);
-    for (int i = 0; i < kMaxDriverDisplays; ++i) {
-        const int d = (start + i) % kMaxDriverDisplays;
-        const uint32_t bit = uint32_t(1) << uint32_t(d);
+    const uint32_t remaining = mask & ((1u << kMaxDriverDisplays) - 1);
+    const int start = g_present_rr.fetch_add(1, std::memory_order_relaxed) % kMaxDriverDisplays;
+    const uint32_t rotated = (remaining >> start) | (remaining << (kMaxDriverDisplays - start));
+    const int bit = __builtin_ctz(rotated);
+    const int d = (start + bit) % kMaxDriverDisplays;
 
-        if ((mask & bit) == 0) {
-            continue;
-        }
-
-        const uint32_t prev = g_present_ready_mask.fetch_and(~bit, std::memory_order_acq_rel);
-        if (prev & bit) {
-            out_drv_display_id = d;
-            return true;
-        }
+    const uint32_t prev = g_present_ready_mask.fetch_and(~(uint32_t(1) << d), std::memory_order_acq_rel);
+    if (prev & (uint32_t(1) << d)) {
+        out_drv_display_id = d;
+        return true;
     }
 
     return false;

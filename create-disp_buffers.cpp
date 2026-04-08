@@ -9,53 +9,48 @@ SlotManager::SlotManager()
 
 void SlotManager::reset()
 {
-    slot_bufid.fill(-1);
-    slot_lastused.fill(0);
-    slot_in_use.fill(0);
+    free_mask = ~0u;
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        slot_bufid[i] = -1;
+        slot_lru_gen[i] = 0;
+    }
     use_counter = 0;
 }
 
 uint32_t SlotManager::assign(int bufid)
 {
     const uint64_t now = ++use_counter;
-    uint32_t free_slot = UINT32_MAX;
-    uint32_t lru_slot = UINT32_MAX;
-    uint64_t lru_time = UINT64_MAX;
 
+    uint32_t used_mask = ~free_mask;
     for (uint32_t i = 0; i < kCapacity; ++i) {
-        if (!slot_in_use[i]) {
-            if (free_slot == UINT32_MAX) {
-                free_slot = i;
+        if (used_mask & (1u << i)) {
+            if (slot_bufid[i] == bufid) {
+                slot_lru_gen[i] = now;
+                return i;
             }
-            continue;
         }
+    }
 
-        if (slot_bufid[i] == bufid) {
-            slot_lastused[i] = now;
-            return i;
-        }
+    if (free_mask != 0) {
+        uint32_t slot = __builtin_ctz(free_mask);
+        free_mask &= ~(1u << slot);
+        slot_bufid[slot] = bufid;
+        slot_lru_gen[slot] = now;
+        return slot;
+    }
 
-        if (slot_lastused[i] < lru_time) {
-            lru_time = slot_lastused[i];
+    uint32_t lru_slot = 0;
+    uint64_t lru_time = UINT64_MAX;
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        if (slot_lru_gen[i] < lru_time) {
+            lru_time = slot_lru_gen[i];
             lru_slot = i;
         }
     }
 
-    if (free_slot != UINT32_MAX) {
-        slot_in_use[free_slot] = 1;
-        slot_bufid[free_slot] = bufid;
-        slot_lastused[free_slot] = now;
-        return free_slot;
-    }
-
-    if (lru_slot == UINT32_MAX) {
-        fprintf(stderr, "SlotManager: exhausted all %u slots\n", kCapacity);
-        return UINT32_MAX;
-    }
-
     const int evicted = slot_bufid[lru_slot];
     slot_bufid[lru_slot] = bufid;
-    slot_lastused[lru_slot] = now;
+    slot_lru_gen[lru_slot] = now;
     fprintf(stderr, "SlotManager: evicted bufid %d from slot %u for bufid %d\n",
             evicted, lru_slot, bufid);
     return lru_slot;
@@ -64,14 +59,12 @@ uint32_t SlotManager::assign(int bufid)
 void SlotManager::release(int bufid)
 {
     for (uint32_t i = 0; i < kCapacity; ++i) {
-        if (!slot_in_use[i] || slot_bufid[i] != bufid) {
-            continue;
+        if ((free_mask & (1u << i)) == 0 && slot_bufid[i] == bufid) {
+            free_mask |= (1u << i);
+            slot_bufid[i] = -1;
+            slot_lru_gen[i] = 0;
+            return;
         }
-
-        slot_in_use[i] = 0;
-        slot_bufid[i] = -1;
-        slot_lastused[i] = 0;
-        return;
     }
 }
 
@@ -251,9 +244,8 @@ void unbind_buffer_everywhere_locked(int buf_id)
 {
     for (int d = 0; d < kMaxDriverDisplays; ++d) {
         g_display_bound_buffers[d].erase(buf_id);
-        auto it = g_displays.find(d);
-        if (it != g_displays.end()) {
-            it->second.slot_mgr.release(buf_id);
+        if (g_display_valid[d]) {
+            g_displays[d].slot_mgr.release(buf_id);
         }
     }
 }
@@ -309,9 +301,8 @@ void buffer_table_shutdown()
         }
 
         for (size_t j = 0; j < kBufferSegmentSize; ++j) {
-            std::atomic_store_explicit(&seg->slots[j].entry,
-                                       std::shared_ptr<BufferEntry>{},
-                                       std::memory_order_release);
+            std::shared_ptr<BufferEntry> entry = std::move(seg->slots[j].entry);
+            seg->slots[j].entry.reset();
         }
 
         delete seg;
@@ -331,7 +322,10 @@ int add_handle(native_handle_t* handle, BufferOrigin origin, int format, uint32_
         return -1;
     }
 
-    auto e = std::make_shared<BufferEntry>();
+    auto e = new (std::nothrow) BufferEntry();
+    if (!e) {
+        return -1;
+    }
     e->origin = origin;
     e->handle = handle;
     e->format = format;
@@ -339,12 +333,13 @@ int add_handle(native_handle_t* handle, BufferOrigin origin, int format, uint32_
     e->width = width;
     e->height = height;
 
+    std::shared_ptr<BufferEntry> se(e);
     if (std::atomic_load_explicit(&slot->entry, std::memory_order_acquire)) {
         fprintf(stderr, "Buffer slot collision for id=%d\n", id);
         return -1;
     }
 
-    std::atomic_store_explicit(&slot->entry, e, std::memory_order_release);
+    std::atomic_store_explicit(&slot->entry, se, std::memory_order_release);
     return id;
 }
 
