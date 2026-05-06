@@ -418,6 +418,12 @@ void reset_display_bindings_locked(int drv_display_id);
 void buffer_table_reserve_ids(size_t count);
 void buffer_table_shutdown();
 int add_handle(native_handle_t* handle, BufferOrigin origin, int format, uint32_t stride, uint32_t width, uint32_t height);
+native_handle_t* clone_handle_from_kernel(int id);
+int ensure_imported_entry_locked(int id,
+                                 int width_hint, int height_hint,
+                                 uint32_t stride_hint, int format_hint,
+                                 std::shared_ptr<BufferEntry>& out);
+bool ensure_imported_entry_for_swap(int id, int drv_display_id, std::shared_ptr<BufferEntry>& out);
 
 SharedRwb load_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry);
 void store_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry, const SharedRwb& rwb);

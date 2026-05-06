@@ -1,4 +1,5 @@
 #include "create-disp_shared.h"
+#include <cstdlib>
 
 namespace create_disp {
 
@@ -360,16 +361,158 @@ void store_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry, const Sha
 
 void get_entry_buffer_geometry(const std::shared_ptr<BufferEntry>& entry, const DisplayRuntimeSnapshot& dsnap, uint32_t& buf_stride, int& buf_w, int& buf_h, int& buf_format)
 {
-    buf_format = entry->format;
-    buf_stride = entry->stride;
+    buf_format = entry->format ? entry->format : HAL_PIXEL_FORMAT_RGBA_8888;
 
     if (entry->origin == BufferOrigin::Imported) {
-        buf_w = entry->width;
-        buf_h = entry->height;
+        buf_stride = entry->stride ? entry->stride : dsnap.stride;
+        buf_w = entry->width ? entry->width : dsnap.width;
+        buf_h = entry->height ? entry->height : dsnap.height;
     } else {
+        buf_stride = entry->stride;
         buf_w = entry->width ? entry->width : dsnap.width;
         buf_h = entry->height ? entry->height : dsnap.height;
     }
+}
+
+namespace {
+
+constexpr size_t kMaxImportedHandleBytes = 4096;
+constexpr int kMaxImportedHandleFds = 64;
+constexpr int kMaxImportedHandleInts = 128;
+
+void destroy_untracked_imported_handle(native_handle_t* handle)
+{
+    if (!handle) {
+        return;
+    }
+
+    for (int i = 0; i < handle->numFds; ++i) {
+        if (handle->data[i] >= 0) {
+            close(handle->data[i]);
+        }
+    }
+
+    std::free(handle);
+}
+
+} // namespace
+
+native_handle_t* clone_handle_from_kernel(int id)
+{
+    std::vector<int> raw(kMaxImportedHandleBytes / sizeof(int), 0);
+    drm_evdi_gbm_get_buff cmd = {};
+    cmd.id = id;
+    cmd.native_handle = raw.data();
+
+    if (drm_ioctl(DRM_IOCTL_EVDI_GBM_GET_BUFF, &cmd) < 0) {
+        return nullptr;
+    }
+
+    native_handle_t* tmp = reinterpret_cast<native_handle_t*>(raw.data());
+    if (tmp->numFds < 0 || tmp->numInts < 0 ||
+        tmp->numFds > kMaxImportedHandleFds ||
+        tmp->numInts > kMaxImportedHandleInts) {
+        const int safe_nfd =
+            (tmp->numFds > 0 && tmp->numFds <= kMaxImportedHandleFds) ? tmp->numFds : 0;
+        for (int i = 0; i < safe_nfd; ++i) {
+            if (tmp->data[i] >= 0) {
+                close(tmp->data[i]);
+            }
+        }
+        return nullptr;
+    }
+
+    const size_t bytes =
+        sizeof(int) * static_cast<size_t>(3 + tmp->numFds + tmp->numInts);
+    if (bytes > kMaxImportedHandleBytes) {
+        for (int i = 0; i < tmp->numFds; ++i) {
+            if (tmp->data[i] >= 0) {
+                close(tmp->data[i]);
+            }
+        }
+        return nullptr;
+    }
+
+    native_handle_t* out = static_cast<native_handle_t*>(std::malloc(bytes));
+    if (!out) {
+        for (int i = 0; i < tmp->numFds; ++i) {
+            if (tmp->data[i] >= 0) {
+                close(tmp->data[i]);
+            }
+        }
+        return nullptr;
+    }
+
+    out->version = tmp->version;
+    out->numFds = tmp->numFds;
+    out->numInts = tmp->numInts;
+
+    for (int i = 0; i < tmp->numFds; ++i) {
+        out->data[i] = tmp->data[i];
+    }
+
+    for (int i = 0; i < tmp->numInts; ++i) {
+        out->data[tmp->numFds + i] = tmp->data[tmp->numFds + i];
+    }
+
+    return out;
+}
+
+int ensure_imported_entry_locked(int id,
+                                 int width_hint, int height_hint,
+                                 uint32_t stride_hint, int format_hint,
+                                 std::shared_ptr<BufferEntry>& out)
+{
+    std::shared_ptr<BufferEntry> cur = get_entry_atomic(id);
+    if (cur && cur->live.load(std::memory_order_acquire) && cur->handle) {
+        out = cur;
+        return 0;
+    }
+
+    native_handle_t* handle = clone_handle_from_kernel(id);
+    if (!handle) {
+        return -ENOENT;
+    }
+
+    BufferSlot* slot = ensure_buffer_slot(id);
+    if (!slot) {
+        destroy_untracked_imported_handle(handle);
+        return -ENOMEM;
+    }
+
+    cur = std::atomic_load_explicit(&slot->entry, std::memory_order_acquire);
+    if (cur && cur->live.load(std::memory_order_acquire) && cur->handle) {
+        destroy_untracked_imported_handle(handle);
+        out = cur;
+        return 0;
+    }
+
+    auto entry = std::make_shared<BufferEntry>();
+    entry->origin = BufferOrigin::Imported;
+    entry->handle = handle;
+    entry->format = format_hint ? format_hint : HAL_PIXEL_FORMAT_RGBA_8888;
+    entry->stride = stride_hint;
+    entry->width = width_hint;
+    entry->height = height_hint;
+
+    std::atomic_store_explicit(&slot->entry, entry, std::memory_order_release);
+    out = entry;
+    return 0;
+}
+
+bool ensure_imported_entry_for_swap(int id, int drv_display_id, std::shared_ptr<BufferEntry>& out)
+{
+    DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(drv_display_id);
+    if (!dsnap.connected || dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(g_state_mutex);
+    return ensure_imported_entry_locked(id,
+                                        dsnap.width, dsnap.height,
+                                        dsnap.stride,
+                                        HAL_PIXEL_FORMAT_RGBA_8888,
+                                        out) == 0;
 }
 
 bool entry_rwb_matches_atomic(const std::shared_ptr<BufferEntry>& entry, int buf_w, int buf_h, uint32_t buf_stride, int buf_format, SharedRwb& out_rwb)
@@ -582,7 +725,8 @@ void swap_to_buff(void *data, int poll_id)
     const int drv_display_id = ex.display_id;
 
     std::shared_ptr<BufferEntry> entry = get_entry_atomic(id);
-    if (!entry || !entry->live.load(std::memory_order_acquire) || !entry->handle) {
+    if ((!entry || !entry->live.load(std::memory_order_acquire) || !entry->handle) &&
+        !ensure_imported_entry_for_swap(id, drv_display_id, entry)) {
         request_display_resync(drv_display_id);
         return;
     }
