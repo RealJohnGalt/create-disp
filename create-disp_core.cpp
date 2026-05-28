@@ -167,9 +167,6 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-            uint32_t numTypes = 0;
-            uint32_t numRequests = 0;
-
             err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                         -1, HAL_DATASPACE_UNKNOWN);
             if (err != HWC2_ERROR_NONE) [[unlikely]] {
@@ -177,24 +174,6 @@ bool do_present(PresentJob& j)
                 request_display_resync(j.drv_display_id);
                 return false;
             }
-
-            err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
-            if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
-                (void)hwc2_compat_display_accept_changes(hwcDisp);
-            } else if (err != HWC2_ERROR_NONE) [[unlikely]] {
-                fprintf(stderr, "validate failed: %d\n", (int)err);
-                request_display_resync(j.drv_display_id);
-                return false;
-            }
-
-            int presentFence = -1;
-            err = hwc2_compat_display_present(hwcDisp, &presentFence);
-        }
-
-        if (err != HWC2_ERROR_NONE) [[unlikely]] {
-            fprintf(stderr, "present failed: %d\n", (int)err);
-            request_display_resync(j.drv_display_id);
-            return false;
         }
     }
 
