@@ -537,6 +537,23 @@ int update_display(int display_id)
         had_previous_mode = (D.width > 0 && D.height > 0 && D.stride != 0);
         mode_changed = (D.width != target_width || D.height != target_height);
 
+#ifdef TARGET_USES_REAL_HWC
+        fprintf(stderr, "REAL HWC, SETUP LAYER AND POWER ON DISPLAY\n");
+        if (D.layer) {
+            hwc2_compat_display_destroy_layer(D.hwcDisplay, D.layer);
+            D.layer = nullptr;
+        }
+        D.layer = hwc2_compat_display_create_layer(D.hwcDisplay);
+        hwc2_compat_layer_set_blend_mode(D.layer, HWC2_BLEND_MODE_NONE);
+        hwc2_compat_layer_set_composition_type(D.layer, HWC2_COMPOSITION_CLIENT);
+        hwc2_compat_layer_set_source_crop(D.layer, 0.0f, 0.0f, config->width, config->height);
+        hwc2_compat_layer_set_display_frame(D.layer, 0, 0, config->width, config->height);
+        hwc2_compat_layer_set_visible_region(D.layer, 0, 0, config->width, config->height);
+
+        hwc2_compat_display_set_power_mode(D.hwcDisplay, HWC2_POWER_MODE_ON);
+        hwc2_compat_display_set_vsync_enabled(D.hwcDisplay, HWC2_VSYNC_ENABLE);
+#endif
+
         if (!force_reconnect && !mode_changed && D.stride != 0) [[likely]] {
             return 0;
         }

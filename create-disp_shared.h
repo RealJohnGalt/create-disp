@@ -191,6 +191,9 @@ struct Display {
     uint32_t stride = 0;
     bool connected = false;
     hwc2_compat_display_t* hwcDisplay = nullptr;
+#ifdef TARGET_USES_REAL_HWC
+    hwc2_compat_layer_t* layer = nullptr;
+#endif
     SlotManager slot_mgr;
     uint64_t generation = 1;
 
