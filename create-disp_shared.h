@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <poll.h>
 #include <shared_mutex>
 #include <sstream>
 #include <thread>
@@ -191,6 +192,7 @@ struct Display {
     uint32_t stride = 0;
     bool connected = false;
     hwc2_compat_display_t* hwcDisplay = nullptr;
+    bool skipVsync = false;
 #ifdef TARGET_USES_REAL_HWC
     hwc2_compat_layer_t* layer = nullptr;
 #endif

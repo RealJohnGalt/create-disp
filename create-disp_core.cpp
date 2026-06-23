@@ -1,3 +1,4 @@
+#include <sync/sync.h>
 #include "create-disp_shared.h"
 
 namespace create_disp {
@@ -170,43 +171,46 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
+            g_displays[j.drv_display_id].skipVsync = true;
+
             uint32_t numTypes = 0;
             uint32_t numRequests = 0;
-#endif
 
             err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                         -1, HAL_DATASPACE_UNKNOWN);
             if (err != HWC2_ERROR_NONE) [[unlikely]] {
                 fprintf(stderr, "set_client_target failed: %d\n", (int)err);
+                g_displays[j.drv_display_id].skipVsync = false;
                 request_display_resync(j.drv_display_id);
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
             if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
                 (void)hwc2_compat_display_accept_changes(hwcDisp);
             } else if (err != HWC2_ERROR_NONE) [[unlikely]] {
                 fprintf(stderr, "validate failed: %d\n", (int)err);
+                g_displays[j.drv_display_id].skipVsync = false;
                 request_display_resync(j.drv_display_id);
                 return false;
             }
 
             int presentFence = -1;
             err = hwc2_compat_display_present(hwcDisp, &presentFence);
-            if (presentFence >= 0)
+            if (presentFence >= 0) {
+                sync_wait(presentFence, -1);
                 close(presentFence);
-#endif
+            }
+
+            g_displays[j.drv_display_id].skipVsync = false;
         }
 
-#ifdef TARGET_USES_REAL_HWC
         if (err != HWC2_ERROR_NONE) [[unlikely]] {
             fprintf(stderr, "present failed: %d\n", (int)err);
+            g_displays[j.drv_display_id].skipVsync = false;
             request_display_resync(j.drv_display_id);
             return false;
         }
-#endif
     }
 
     dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
@@ -215,6 +219,7 @@ bool do_present(PresentJob& j)
     }
 
     g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
+
     return true;
 }
 

@@ -326,23 +326,22 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
 
     const long long hwc_id = (long long)display;
     int drv_id = drv_id_for_hwc_atomic(hwc_id);
-
     if (drv_id < 0) {
         std::lock_guard<std::mutex> lk(g_display_mutex);
         drv_id = drv_id_for_hwc(hwc_id);
     }
+    if (drv_id < 0)
+        return;
 
-    if (drv_id >= 0) {
 #ifndef TARGET_USES_REAL_HWC
-        if (!g_display_power_mode[drv_id])
-            return;
+    if (g_display_power_mode[drv_id] == 0)
+        return;
 #endif
-        int vsync_ret = evdi_vsync(drv_id);
-        if (vsync_ret < 0 && errno != ETIMEDOUT && errno != ENODEV && errno != EBADF) {
-            fprintf(stderr, "vsync failed for display %d: %d (%s)\n",
-                    drv_id, errno, strerror(errno));
-        }
-    }
+
+    if (g_displays[drv_id].skipVsync)
+        return;
+
+    evdi_vsync(drv_id);
 }
 
 void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_display_t display, bool connected, bool primaryDisplay)
@@ -646,6 +645,8 @@ void disconnect_display(int drv_id)
             release_driver_slot_for_hwc(hwc_id);
         }
     }
+
+    g_displays[drv_id].skipVsync = false;
 }
 
 }
