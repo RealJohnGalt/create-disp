@@ -342,6 +342,11 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
             fprintf(stderr, "vsync failed for display %d: %d (%s)\n",
                     drv_id, errno, strerror(errno));
         }
+        if (g_vsync_waiting[drv_id].load(std::memory_order_acquire)) {
+            g_vsync_count[drv_id].fetch_add(1, std::memory_order_release);
+            std::lock_guard<std::mutex> lk(g_vsync_mutex[drv_id]);
+            g_vsync_cv[drv_id].notify_one();
+        }
     }
 }
 

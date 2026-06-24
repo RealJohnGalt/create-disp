@@ -39,6 +39,10 @@ std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
 #ifndef TARGET_USES_REAL_HWC
 std::array<std::atomic<int>, kMaxDriverDisplays> g_display_power_mode = {1, 1, 1, 1, 1};
 #endif
+std::array<std::mutex, kMaxDriverDisplays> g_vsync_mutex;
+std::array<std::condition_variable, kMaxDriverDisplays> g_vsync_cv;
+std::array<std::atomic<uint64_t>, kMaxDriverDisplays> g_vsync_count{};
+std::array<std::atomic<bool>, kMaxDriverDisplays> g_vsync_waiting{};
 
 void request_reopen()
 {
@@ -170,10 +174,8 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             uint32_t numTypes = 0;
             uint32_t numRequests = 0;
-#endif
 
             err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                         -1, HAL_DATASPACE_UNKNOWN);
@@ -183,7 +185,6 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
             if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
                 (void)hwc2_compat_display_accept_changes(hwcDisp);
@@ -197,16 +198,25 @@ bool do_present(PresentJob& j)
             err = hwc2_compat_display_present(hwcDisp, &presentFence);
             if (presentFence >= 0)
                 close(presentFence);
-#endif
-        }
+            if (err != HWC2_ERROR_NONE) [[unlikely]] {
+                fprintf(stderr, "present failed: %d\n", (int)err);
+                request_display_resync(j.drv_display_id);
+                return false;
+            }
 
-#ifdef TARGET_USES_REAL_HWC
-        if (err != HWC2_ERROR_NONE) [[unlikely]] {
-            fprintf(stderr, "present failed: %d\n", (int)err);
-            request_display_resync(j.drv_display_id);
-            return false;
+
         }
-#endif
+    }
+
+    {
+        g_vsync_waiting[j.drv_display_id].store(true, std::memory_order_release);
+        uint64_t count = g_vsync_count[j.drv_display_id].load(std::memory_order_acquire);
+        {
+            std::unique_lock<std::mutex> lk(g_vsync_mutex[j.drv_display_id]);
+            g_vsync_cv[j.drv_display_id].wait_for(lk, std::chrono::seconds(1),
+                [&] { return g_vsync_count[j.drv_display_id].load(std::memory_order_acquire) > count; });
+        }
+        g_vsync_waiting[j.drv_display_id].store(false, std::memory_order_release);
     }
 
     dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
