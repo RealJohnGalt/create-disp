@@ -1,4 +1,5 @@
 #include "create-disp_shared.h"
+#include <poll.h>
 
 namespace create_disp {
 
@@ -170,10 +171,8 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             uint32_t numTypes = 0;
             uint32_t numRequests = 0;
-#endif
 
             err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                         -1, HAL_DATASPACE_UNKNOWN);
@@ -183,7 +182,6 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
             if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
                 (void)hwc2_compat_display_accept_changes(hwcDisp);
@@ -197,16 +195,31 @@ bool do_present(PresentJob& j)
             err = hwc2_compat_display_present(hwcDisp, &presentFence);
             if (presentFence >= 0)
                 close(presentFence);
-#endif
-        }
+            if (err != HWC2_ERROR_NONE) [[unlikely]] {
+                fprintf(stderr, "present failed: %d\n", (int)err);
+                request_display_resync(j.drv_display_id);
+                return false;
+            }
 
-#ifdef TARGET_USES_REAL_HWC
-        if (err != HWC2_ERROR_NONE) [[unlikely]] {
-            fprintf(stderr, "present failed: %d\n", (int)err);
-            request_display_resync(j.drv_display_id);
-            return false;
+            hwc2_compat_out_fences_t* releaseFences = nullptr;
+            err = hwc2_compat_display_get_release_fences(hwcDisp, &releaseFences);
+            if (err == HWC2_ERROR_NONE && releaseFences) {
+                hwc2_compat_layer_t* layer = hwc2_compat_display_create_layer(hwcDisp);
+                if (layer) {
+                    int releaseFd = hwc2_compat_out_fences_get_fence(releaseFences, layer);
+                    if (releaseFd >= 0) {
+                        struct pollfd pfd = { .fd = releaseFd, .events = POLLIN };
+                        int pr;
+                        do {
+                            pr = poll(&pfd, 1, 1000);
+                        } while (pr < 0 && errno == EINTR);
+                        close(releaseFd);
+                    }
+                    hwc2_compat_display_destroy_layer(hwcDisp, layer);
+                }
+                hwc2_compat_out_fences_destroy(releaseFences);
+            }
         }
-#endif
     }
 
     dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
