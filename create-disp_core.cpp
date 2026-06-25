@@ -1,4 +1,5 @@
 #include "create-disp_shared.h"
+#include <sync/sync.h>
 
 namespace create_disp {
 
@@ -196,8 +197,10 @@ bool do_present(PresentJob& j)
 
             int presentFence = -1;
             err = hwc2_compat_display_present(hwcDisp, &presentFence);
-            if (presentFence >= 0)
+            if (presentFence >= 0) {
+                sync_wait(presentFence, 1000);
                 close(presentFence);
+            }
             if (err != HWC2_ERROR_NONE) [[unlikely]] {
                 fprintf(stderr, "present failed: %d\n", (int)err);
                 request_display_resync(j.drv_display_id);
