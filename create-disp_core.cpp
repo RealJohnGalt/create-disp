@@ -1,4 +1,5 @@
 #include "create-disp_shared.h"
+#include <sync/sync.h>
 
 namespace create_disp {
 
@@ -170,10 +171,8 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             uint32_t numTypes = 0;
             uint32_t numRequests = 0;
-#endif
 
             err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                         -1, HAL_DATASPACE_UNKNOWN);
@@ -183,7 +182,6 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
             if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
                 (void)hwc2_compat_display_accept_changes(hwcDisp);
@@ -197,16 +195,14 @@ bool do_present(PresentJob& j)
             err = hwc2_compat_display_present(hwcDisp, &presentFence);
             if (presentFence >= 0)
                 close(presentFence);
-#endif
-        }
 
-#ifdef TARGET_USES_REAL_HWC
-        if (err != HWC2_ERROR_NONE) [[unlikely]] {
-            fprintf(stderr, "present failed: %d\n", (int)err);
-            request_display_resync(j.drv_display_id);
-            return false;
+            evdi_vsync(j.drv_display_id);
+            if (err != HWC2_ERROR_NONE) [[unlikely]] {
+                fprintf(stderr, "present failed: %d\n", (int)err);
+                request_display_resync(j.drv_display_id);
+                return false;
+            }
         }
-#endif
     }
 
     dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
