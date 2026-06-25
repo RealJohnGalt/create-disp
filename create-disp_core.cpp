@@ -207,6 +207,17 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
+            hwc2_compat_out_fences_t* releaseFences = nullptr;
+            (void)hwc2_compat_display_get_release_fences(hwcDisp, &releaseFences);
+            if (releaseFences) {
+                int releaseFence = hwc2_compat_out_fences_get_display_fence(
+                    releaseFences, static_cast<hwc2_display_t>(dsnap.hwc_id));
+                if (releaseFence >= 0) {
+                    sync_wait(releaseFence, 1000);
+                    close(releaseFence);
+                }
+                hwc2_compat_out_fences_destroy(releaseFences);
+            }
 
         }
     }
