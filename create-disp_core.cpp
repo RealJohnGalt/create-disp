@@ -164,13 +164,13 @@ bool do_present(PresentJob& j)
         return false;
     }
 
+    uint64_t vsync_base = g_vsync_count[j.drv_display_id].load(std::memory_order_acquire);
+
     int prevReleaseFence = g_pending_release_fence[j.drv_display_id].exchange(-1);
     if (prevReleaseFence >= 0) {
         sync_wait(prevReleaseFence, 1000);
         close(prevReleaseFence);
     }
-
-    uint64_t vsync_base = g_vsync_count[j.drv_display_id].load(std::memory_order_acquire);
 
     {
         hwc2_compat_display_t* hwcDisp = dsnap.hwcDisplay;
