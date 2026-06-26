@@ -200,6 +200,7 @@ bool do_present(PresentJob& j)
             if (presentFence >= 0) {
                 sync_wait(presentFence, 1000);
                 close(presentFence);
+                evdi_vsync(j.drv_display_id);
             }
             if (err != HWC2_ERROR_NONE) [[unlikely]] {
                 fprintf(stderr, "present failed: %d\n", (int)err);

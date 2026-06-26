@@ -337,11 +337,6 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
         if (!g_display_power_mode[drv_id])
             return;
 #endif
-        int vsync_ret = evdi_vsync(drv_id);
-        if (vsync_ret < 0 && errno != ETIMEDOUT && errno != ENODEV && errno != EBADF) {
-            fprintf(stderr, "vsync failed for display %d: %d (%s)\n",
-                    drv_id, errno, strerror(errno));
-        }
         if (g_vsync_waiting[drv_id].load(std::memory_order_acquire)) {
             g_vsync_count[drv_id].fetch_add(1, std::memory_order_release);
             std::lock_guard<std::mutex> lk(g_vsync_mutex[drv_id]);
