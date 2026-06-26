@@ -563,37 +563,71 @@ void get_buf_from_map(const std::array<uint8_t, 32>& data, int poll_id)
     (void)drm_ioctl(DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
 }
 
+int find_other_buffer(int drv_display_id, int current_id, int prev_id)
+{
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return 0;
+
+    std::lock_guard<std::mutex> lk(g_display_mutex);
+
+    const auto& bound = g_display_bound_buffers[drv_display_id];
+
+    if (prev_id > 0 && prev_id != current_id && bound.count(prev_id))
+        return prev_id;
+
+    for (int buf_id : bound) {
+        if (buf_id != current_id && buf_id > 0)
+            return buf_id;
+    }
+
+    return 0;
+}
+
 void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
 {
     (void)poll_id;
 
     struct SwapEvent {
         int id;
+        int prev_id;
         int display_id;
-    } ex{-1, 0};
+    } ex{-1, 0, 0};
 
-    static_assert(sizeof(SwapEvent) == sizeof(int) * 2);
-    memcpy(&ex, data.data(), sizeof(ex));
+    static_assert(sizeof(SwapEvent) <= 32);
+    memcpy(&ex, data.data(), sizeof(SwapEvent));
 
     const int id = ex.id;
+    const int prev_id = ex.prev_id;
     const int drv_display_id = ex.display_id;
 
-    std::shared_ptr<BufferEntry> entry = get_entry_atomic(id);
+    int render_id = find_other_buffer(drv_display_id, id, prev_id);
+    if (render_id == 0)
+        render_id = id;
+
+    g_render_target[drv_display_id] = render_id;
+
+    std::shared_ptr<BufferEntry> entry = get_entry_atomic(render_id);
     if (!entry || !entry->live.load(std::memory_order_acquire) || !entry->handle) {
-        request_display_resync(drv_display_id);
-        return;
+        if (render_id != id) {
+            render_id = id;
+            g_render_target[drv_display_id] = render_id;
+            entry = get_entry_atomic(render_id);
+        }
+        if (!entry || !entry->live.load(std::memory_order_acquire) || !entry->handle) {
+            request_display_resync(drv_display_id);
+            return;
+        }
     }
 
     PresentJob j;
-    switch (prepare_present_job_fast(id, drv_display_id, entry, j)) {
+    switch (prepare_present_job_fast(render_id, drv_display_id, entry, j)) {
     case PreparePresentJobResult::Ready:
         break;
     case PreparePresentJobResult::Abort:
         return;
     case PreparePresentJobResult::NeedSlow:
-        if (!prepare_present_job_slow(id, drv_display_id, entry, j)) {
+        if (!prepare_present_job_slow(render_id, drv_display_id, entry, j))
             return;
-        }
         break;
     }
 

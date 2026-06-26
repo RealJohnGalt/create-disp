@@ -36,6 +36,7 @@ std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segments{};
 std::mutex g_buffer_segment_alloc_mutex;
 std::atomic<uint32_t> g_next_buffer_id{1};
 std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
+std::array<int, kMaxDriverDisplays> g_render_target{};
 #ifndef TARGET_USES_REAL_HWC
 std::array<std::atomic<int>, kMaxDriverDisplays> g_display_power_mode = {1, 1, 1, 1, 1};
 #endif

@@ -307,6 +307,7 @@ extern std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segm
 extern std::mutex g_buffer_segment_alloc_mutex;
 extern std::atomic<uint32_t> g_next_buffer_id;
 extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
+extern std::array<int, kMaxDriverDisplays> g_render_target;
 #ifndef TARGET_USES_REAL_HWC
 extern std::array<std::atomic<int>, kMaxDriverDisplays> g_display_power_mode;
 #endif
@@ -345,6 +346,7 @@ std::shared_ptr<BufferEntry> get_entry_atomic(int id);
 void unbind_buffer_from_display_locked(int buf_id, int drv_display_id);
 void reset_buffer_binding_locked(int buf_id, const std::shared_ptr<BufferEntry>& entry);
 bool buffer_entry_is_live_atomic(int buf_id, const std::shared_ptr<BufferEntry>& entry);
+int find_other_buffer(int drv_display_id, int current_id, int prev_id);
 void bind_buffer_to_display_locked(int buf_id, const std::shared_ptr<BufferEntry>& entry, int drv_display_id, uint64_t generation, uint32_t slot);
 std::shared_ptr<BufferEntry> remove_entry_atomic(int id);
 void unbind_buffer_everywhere_locked(int buf_id);
