@@ -337,8 +337,8 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
         if (!g_display_power_mode[drv_id])
             return;
 #endif
+        g_vsync_count[drv_id].fetch_add(1, std::memory_order_release);
         if (g_vsync_waiting[drv_id].load(std::memory_order_acquire)) {
-            g_vsync_count[drv_id].fetch_add(1, std::memory_order_release);
             std::lock_guard<std::mutex> lk(g_vsync_mutex[drv_id]);
             g_vsync_cv[drv_id].notify_one();
         }
