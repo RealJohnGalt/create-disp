@@ -342,6 +342,13 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
             std::lock_guard<std::mutex> lk(g_vsync_mutex[drv_id]);
             g_vsync_cv[drv_id].notify_one();
         }
+        std::thread([drv_id]() {
+            int vsync_ret = evdi_vsync(drv_id);
+            if (vsync_ret < 0 && errno != ETIMEDOUT && errno != ENODEV && errno != EBADF) {
+                fprintf(stderr, "vsync failed for display %d: %d (%s)\n",
+                        drv_id, errno, strerror(errno));
+            }
+        }).detach();
     }
 }
 
