@@ -315,7 +315,6 @@ extern std::array<std::mutex, kMaxDriverDisplays> g_vsync_mutex;
 extern std::array<std::condition_variable, kMaxDriverDisplays> g_vsync_cv;
 extern std::array<std::atomic<uint64_t>, kMaxDriverDisplays> g_vsync_count;
 extern std::array<std::atomic<bool>, kMaxDriverDisplays> g_vsync_waiting;
-extern std::array<std::atomic<int>, kMaxDriverDisplays> g_pending_release_fence;
 
 void request_reopen();
 int ioctl_retry(int fd, unsigned long req, void *arg);

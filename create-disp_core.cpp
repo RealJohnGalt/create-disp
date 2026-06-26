@@ -44,11 +44,6 @@ std::array<std::mutex, kMaxDriverDisplays> g_vsync_mutex;
 std::array<std::condition_variable, kMaxDriverDisplays> g_vsync_cv;
 std::array<std::atomic<uint64_t>, kMaxDriverDisplays> g_vsync_count{};
 std::array<std::atomic<bool>, kMaxDriverDisplays> g_vsync_waiting{};
-std::array<std::atomic<int>, kMaxDriverDisplays> g_pending_release_fence;
-namespace { const bool _init_rf = []{
-    for (auto& f : g_pending_release_fence) f.store(-1, std::memory_order_relaxed);
-    return true;
-}(); }
 
 void request_reopen()
 {
@@ -166,12 +161,6 @@ bool do_present(PresentJob& j)
 
     uint64_t vsync_base = g_vsync_count[j.drv_display_id].load(std::memory_order_acquire);
 
-    int prevReleaseFence = g_pending_release_fence[j.drv_display_id].exchange(-1);
-    if (prevReleaseFence >= 0) {
-        sync_wait(prevReleaseFence, 1000);
-        close(prevReleaseFence);
-    }
-
     {
         hwc2_compat_display_t* hwcDisp = dsnap.hwcDisplay;
         hwc2_error_t err = HWC2_ERROR_NONE;
@@ -219,17 +208,6 @@ bool do_present(PresentJob& j)
                 fprintf(stderr, "present failed: %d\n", (int)err);
                 request_display_resync(j.drv_display_id);
                 return false;
-            }
-
-            hwc2_compat_out_fences_t* releaseFences = nullptr;
-            (void)hwc2_compat_display_get_release_fences(hwcDisp, &releaseFences);
-            if (releaseFences) {
-                int rf = hwc2_compat_out_fences_get_display_fence(
-                    releaseFences, static_cast<hwc2_display_t>(dsnap.hwc_id));
-                if (rf >= 0) {
-                    g_pending_release_fence[j.drv_display_id].store(rf, std::memory_order_release);
-                }
-                hwc2_compat_out_fences_destroy(releaseFences);
             }
 
         }
