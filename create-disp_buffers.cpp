@@ -565,8 +565,6 @@ void get_buf_from_map(const std::array<uint8_t, 32>& data, int poll_id)
 
 void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
 {
-    (void)poll_id;
-
     struct SwapEvent {
         int id;
         int display_id;
@@ -577,6 +575,13 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
 
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
+
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
+        std::fprintf(stderr,
+                     "swap_to_buff: invalid display_id=%d for buf_id=%d (poll_id=%d)\n",
+                     drv_display_id, id, poll_id);
+        return;
+    }
 
     std::shared_ptr<BufferEntry> entry = get_entry_atomic(id);
     if (!entry || !entry->live.load(std::memory_order_acquire) || !entry->handle) {
@@ -597,7 +602,13 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
         break;
     }
 
-    do_present(j);
+    if (j.drv_display_id != drv_display_id || !j.rwb) {
+        request_display_resync(drv_display_id);
+        return;
+    }
+
+    const uint32_t event_seq = (poll_id > 0) ? static_cast<uint32_t>(poll_id) : 0;
+    queue_prepared_present(drv_display_id, j, event_seq);
 }
 
 void destroy_buff(const std::array<uint8_t, 32>& data, int poll_id)

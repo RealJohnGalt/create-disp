@@ -9,7 +9,10 @@ int g_free_drv_count = 0;
 bool g_free_drv_ids_initialized = false;
 std::atomic<bool> drm_ready{false};
 std::array<std::atomic<bool>, kMaxDriverDisplays> g_resync_pending{};
-
+std::array<std::mutex, kMaxDriverDisplays> g_present_mutex;
+std::array<PreparedPresent, kMaxDriverDisplays> g_prepared_present_curr{};
+std::array<PreparedPresent, kMaxDriverDisplays> g_prepared_present_next{};
+std::array<uint32_t, kMaxDriverDisplays> g_last_presented_event_seq{};
 std::mutex g_display_mutex;
 std::mutex g_buffer_mutex;
 std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
@@ -27,6 +30,92 @@ std::thread g_poll_thread;
 std::atomic<bool> g_running{true};
 
 hwc2_compat_device_t* hwcDevice = nullptr;
+
+void clear_prepared_present_locked(PreparedPresent& p)
+{
+    p.valid = false;
+    p.job = {};
+    p.event_seq = 0;
+}
+
+void clear_present_state_locked(int drv_display_id)
+{
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> present_lk(g_present_mutex[drv_display_id]);
+    clear_prepared_present_locked(g_prepared_present_curr[drv_display_id]);
+    clear_prepared_present_locked(g_prepared_present_next[drv_display_id]);
+    g_last_presented_event_seq[drv_display_id] = 0;
+}
+
+void clear_present_state(int drv_display_id)
+{
+    clear_present_state_locked(drv_display_id);
+}
+
+void queue_prepared_present(int drv_display_id, const PresentJob& job, uint32_t event_seq)
+{
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> present_lk(g_present_mutex[drv_display_id]);
+    PreparedPresent& next = g_prepared_present_next[drv_display_id];
+    next.valid = true;
+    next.event_seq = event_seq;
+    next.job = job;
+}
+
+bool present_prepared_swap(int drv_display_id)
+{
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
+        return false;
+    }
+
+    PreparedPresent prepared;
+    {
+        std::lock_guard<std::mutex> present_lk(g_present_mutex[drv_display_id]);
+        PreparedPresent& next = g_prepared_present_next[drv_display_id];
+        PreparedPresent& curr = g_prepared_present_curr[drv_display_id];
+
+        if (next.valid) {
+            curr = next;
+            clear_prepared_present_locked(next);
+        }
+
+        if (!curr.valid) {
+            return false;
+        }
+
+        if (curr.event_seq != 0 &&
+            curr.event_seq == g_last_presented_event_seq[drv_display_id]) {
+            clear_prepared_present_locked(curr);
+            return false;
+        }
+        prepared = curr;
+    }
+
+    if (!do_present(prepared.job)) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> present_lk(g_present_mutex[drv_display_id]);
+        g_last_presented_event_seq[drv_display_id] = prepared.event_seq;
+
+        PreparedPresent& curr = g_prepared_present_curr[drv_display_id];
+        if (curr.valid &&
+            curr.event_seq == prepared.event_seq &&
+            curr.event_seq != 0) {
+            clear_prepared_present_locked(curr);
+        }
+    }
+
+    return true;
+}
+
 std::atomic<int> drm_fd{-1};
 
 std::array<Display, kMaxDriverDisplays> g_displays{};
@@ -170,10 +259,8 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             uint32_t numTypes = 0;
             uint32_t numRequests = 0;
-#endif
 
             err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                         -1, HAL_DATASPACE_UNKNOWN);
@@ -183,7 +270,6 @@ bool do_present(PresentJob& j)
                 return false;
             }
 
-#ifdef TARGET_USES_REAL_HWC
             err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
             if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
                 (void)hwc2_compat_display_accept_changes(hwcDisp);
@@ -195,18 +281,18 @@ bool do_present(PresentJob& j)
 
             int presentFence = -1;
             err = hwc2_compat_display_present(hwcDisp, &presentFence);
-            if (presentFence >= 0)
-                close(presentFence);
-#endif
+            if (err != HWC2_ERROR_NONE) [[unlikely]] {
+                if (presentFence >= 0) {
+                    ::close(presentFence);
+                }
+                fprintf(stderr, "present failed: %d\n", (int)err);
+                request_display_resync(j.drv_display_id);
+                return false;
+            }
+            if (presentFence >= 0) {
+                ::close(presentFence);
+            }
         }
-
-#ifdef TARGET_USES_REAL_HWC
-        if (err != HWC2_ERROR_NONE) [[unlikely]] {
-            fprintf(stderr, "present failed: %d\n", (int)err);
-            request_display_resync(j.drv_display_id);
-            return false;
-        }
-#endif
     }
 
     dsnap = snapshot_display_runtime_atomic(j.drv_display_id);

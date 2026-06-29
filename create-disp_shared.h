@@ -264,6 +264,12 @@ struct PresentJob {
     SharedRwb rwb;
 };
 
+struct PreparedPresent {
+    bool valid = false;
+    uint32_t event_seq = 0;
+    PresentJob job;
+};
+
 enum class PreparePresentJobResult : uint8_t {
     Ready = 0,
     NeedSlow = 1,
@@ -311,6 +317,11 @@ extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_b
 extern std::array<std::atomic<int>, kMaxDriverDisplays> g_display_power_mode;
 #endif
 
+extern std::array<std::mutex, kMaxDriverDisplays> g_present_mutex;
+extern std::array<PreparedPresent, kMaxDriverDisplays> g_prepared_present_curr;
+extern std::array<PreparedPresent, kMaxDriverDisplays> g_prepared_present_next;
+extern std::array<uint32_t, kMaxDriverDisplays> g_last_presented_event_seq;
+
 void request_reopen();
 int ioctl_retry(int fd, unsigned long req, void *arg);
 int drm_get_fd();
@@ -320,6 +331,10 @@ bool should_request_reopen(int err);
 void clear_pending_work_atomic(int drv_display_id);
 void publish_update_work(int drv_display_id, uint8_t work_bits);
 void schedule_update(int drv_display_id);
+void clear_present_state(int drv_display_id);
+void clear_prepared_present_locked(PreparedPresent& p);
+void queue_prepared_present(int drv_display_id, const PresentJob& job, uint32_t event_seq);
+void clear_present_state_locked(int drv_display_id);
 void schedule_disconnect(int drv_display_id);
 bool take_next_update_display(int& out_drv_display_id);
 
@@ -382,6 +397,7 @@ void get_buf_from_map(const std::array<uint8_t, 32>& data, int poll_id);
 void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id);
 void destroy_buff(const std::array<uint8_t, 32>& data, int poll_id);
 void create_buff(const std::array<uint8_t, 32>& data, int poll_id);
+bool present_prepared_swap(int drv_display_id);
 
 void update_thread_main();
 void poll_thread_main();

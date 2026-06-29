@@ -332,15 +332,29 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
         drv_id = drv_id_for_hwc(hwc_id);
     }
 
-    if (drv_id >= 0) {
+    if (drv_id < 0) {
+        return;
+    }
+
 #ifndef TARGET_USES_REAL_HWC
-        if (!g_display_power_mode[drv_id])
-            return;
+    if (!g_display_power_mode[drv_id])
+        return;
 #endif
-        int vsync_ret = evdi_vsync(drv_id);
-        if (vsync_ret < 0 && errno != ETIMEDOUT && errno != ENODEV && errno != EBADF) {
-            fprintf(stderr, "vsync failed for display %d: %d (%s)\n",
-                    drv_id, errno, strerror(errno));
+
+    int ret = evdi_vsync(drv_id);
+    if (ret < 0) {
+        std::fprintf(stderr,
+                     "evdi_vsync failed for display %d: %d (%s)\n",
+                     drv_id, errno, strerror(errno));
+        if (should_request_reopen(errno)) {
+            request_reopen();
+        }
+        return;
+    }
+
+    if (!present_prepared_swap(drv_id)) {
+        if (g_resync_pending[drv_id].load(std::memory_order_acquire)) {
+            schedule_update(drv_id);
         }
     }
 }
@@ -564,6 +578,7 @@ int update_display(int display_id)
                force_reconnect ? " (forced resync)" : "");
 
         reset_display_bindings_locked(display_id);
+        clear_present_state_locked(display_id);
 
         D.generation++;
         generation = D.generation;
@@ -640,6 +655,7 @@ void disconnect_display(int drv_id)
         publish_display_runtime_locked(drv_id);
 
         g_resync_pending[drv_id].store(false, std::memory_order_release);
+        clear_present_state_locked(drv_id);
         clear_pending_work_atomic(drv_id);
 
         if (hwc_id != 0) {
