@@ -31,11 +31,69 @@ std::atomic<bool> g_running{true};
 
 hwc2_compat_device_t* hwcDevice = nullptr;
 
+namespace {
+
+inline void clear_present_job_no_close(PresentJob& job)
+{
+    job.drv_display_id = 0;
+    job.buf_id = -1;
+    job.slot = 0;
+    job.generation = 0;
+    job.rwb.reset();
+    job.acquire_fence_fd = -1;
+}
+
+} // namespace
+
+void close_acquire_fence_fd(int& fd)
+{
+    if (fd >= 0) {
+        ::close(fd);
+        fd = -1;
+    }
+}
+
+void reset_present_job(PresentJob& job)
+{
+    close_acquire_fence_fd(job.acquire_fence_fd);
+    clear_present_job_no_close(job);
+}
+
+void move_present_job(PresentJob& dst, PresentJob& src)
+{
+    if (&dst == &src) {
+        return;
+    }
+
+    reset_present_job(dst);
+    dst.drv_display_id = src.drv_display_id;
+    dst.buf_id = src.buf_id;
+    dst.slot = src.slot;
+    dst.generation = src.generation;
+    dst.rwb = std::move(src.rwb);
+    dst.acquire_fence_fd = src.acquire_fence_fd;
+    clear_present_job_no_close(src);
+}
+
 void clear_prepared_present_locked(PreparedPresent& p)
 {
     p.valid = false;
-    p.job = {};
+    reset_present_job(p.job);
     p.event_seq = 0;
+}
+
+void move_prepared_present(PreparedPresent& dst, PreparedPresent& src)
+{
+    if (&dst == &src) {
+        return;
+    }
+
+    clear_prepared_present_locked(dst);
+    dst.valid = src.valid;
+    dst.event_seq = src.event_seq;
+    move_present_job(dst.job, src.job);
+    src.valid = false;
+    src.event_seq = 0;
 }
 
 void clear_present_state_locked(int drv_display_id)
@@ -55,17 +113,19 @@ void clear_present_state(int drv_display_id)
     clear_present_state_locked(drv_display_id);
 }
 
-void queue_prepared_present(int drv_display_id, const PresentJob& job, uint32_t event_seq)
+void queue_prepared_present(int drv_display_id, PresentJob&& job, uint32_t event_seq)
 {
     if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
+        reset_present_job(job);
         return;
     }
 
     std::lock_guard<std::mutex> present_lk(g_present_mutex[drv_display_id]);
     PreparedPresent& next = g_prepared_present_next[drv_display_id];
+    clear_prepared_present_locked(next);
     next.valid = true;
     next.event_seq = event_seq;
-    next.job = job;
+    move_present_job(next.job, job);
 }
 
 bool present_prepared_swap(int drv_display_id)
@@ -81,38 +141,33 @@ bool present_prepared_swap(int drv_display_id)
         PreparedPresent& curr = g_prepared_present_curr[drv_display_id];
 
         if (next.valid) {
-            curr = next;
-            clear_prepared_present_locked(next);
+            clear_prepared_present_locked(curr);
+            move_prepared_present(curr, next);
         }
 
         if (!curr.valid) {
             return false;
         }
 
-        if (curr.event_seq != 0 &&
-            curr.event_seq == g_last_presented_event_seq[drv_display_id]) {
+        if (curr.event_seq != 0 && curr.event_seq == g_last_presented_event_seq[drv_display_id]) {
             clear_prepared_present_locked(curr);
             return false;
         }
-        prepared = curr;
+
+        move_prepared_present(prepared, curr);
     }
 
     if (!do_present(prepared.job)) {
+        clear_prepared_present_locked(prepared);
         return false;
     }
 
     {
         std::lock_guard<std::mutex> present_lk(g_present_mutex[drv_display_id]);
         g_last_presented_event_seq[drv_display_id] = prepared.event_seq;
-
-        PreparedPresent& curr = g_prepared_present_curr[drv_display_id];
-        if (curr.valid &&
-            curr.event_seq == prepared.event_seq &&
-            curr.event_seq != 0) {
-            clear_prepared_present_locked(curr);
-        }
     }
 
+    clear_prepared_present_locked(prepared);
     return true;
 }
 
@@ -235,11 +290,13 @@ bool take_next_update_display(int& out_drv_display_id)
 bool do_present(PresentJob& j)
 {
     if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays || !j.rwb) [[unlikely]] {
+        close_acquire_fence_fd(j.acquire_fence_fd);
         return false;
     }
 
     DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
     if (!display_runtime_present_ready(dsnap, j.generation)) [[unlikely]] {
+        close_acquire_fence_fd(j.acquire_fence_fd);
         return false;
     }
 
@@ -251,20 +308,28 @@ bool do_present(PresentJob& j)
 
             dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
             if (!display_runtime_present_ready(dsnap, j.generation)) [[unlikely]] {
+                close_acquire_fence_fd(j.acquire_fence_fd);
                 return false;
             }
 
             hwcDisp = dsnap.hwcDisplay;
             if (!hwcDisp) [[unlikely]] {
+                close_acquire_fence_fd(j.acquire_fence_fd);
                 return false;
             }
 
             uint32_t numTypes = 0;
             uint32_t numRequests = 0;
+            const int acquire_fence_fd = j.acquire_fence_fd;
 
             err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
-                                                        -1, HAL_DATASPACE_UNKNOWN);
+                                                        acquire_fence_fd,
+                                                        HAL_DATASPACE_UNKNOWN);
+            j.acquire_fence_fd = -1;
             if (err != HWC2_ERROR_NONE) [[unlikely]] {
+                if (acquire_fence_fd >= 0) {
+                    ::close(acquire_fence_fd);
+                }
                 fprintf(stderr, "set_client_target failed: %d\n", (int)err);
                 request_display_resync(j.drv_display_id);
                 return false;
@@ -297,10 +362,12 @@ bool do_present(PresentJob& j)
 
     dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
     if (!display_runtime_present_ready(dsnap, j.generation)) [[unlikely]] {
+        close_acquire_fence_fd(j.acquire_fence_fd);
         return false;
     }
 
     g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
+    close_acquire_fence_fd(j.acquire_fence_fd);
     return true;
 }
 

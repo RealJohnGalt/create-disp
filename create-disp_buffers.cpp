@@ -568,23 +568,25 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
     struct SwapEvent {
         int id;
         int display_id;
+        int acquire_fence_fd;
     } ex{-1, 0};
 
-    static_assert(sizeof(SwapEvent) == sizeof(int) * 2);
+    static_assert(sizeof(SwapEvent) == sizeof(int) * 3, "SwapEvent size mismatch");
     memcpy(&ex, data.data(), sizeof(ex));
 
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
-
     if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
         std::fprintf(stderr,
                      "swap_to_buff: invalid display_id=%d for buf_id=%d (poll_id=%d)\n",
                      drv_display_id, id, poll_id);
+        close_acquire_fence_fd(ex.acquire_fence_fd);
         return;
     }
 
     std::shared_ptr<BufferEntry> entry = get_entry_atomic(id);
     if (!entry || !entry->live.load(std::memory_order_acquire) || !entry->handle) {
+        close_acquire_fence_fd(ex.acquire_fence_fd);
         request_display_resync(drv_display_id);
         return;
     }
@@ -594,21 +596,26 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
     case PreparePresentJobResult::Ready:
         break;
     case PreparePresentJobResult::Abort:
+        close_acquire_fence_fd(ex.acquire_fence_fd);
         return;
     case PreparePresentJobResult::NeedSlow:
         if (!prepare_present_job_slow(id, drv_display_id, entry, j)) {
+            close_acquire_fence_fd(ex.acquire_fence_fd);
             return;
         }
         break;
     }
 
     if (j.drv_display_id != drv_display_id || !j.rwb) {
+        close_acquire_fence_fd(ex.acquire_fence_fd);
         request_display_resync(drv_display_id);
         return;
     }
 
+    j.acquire_fence_fd = ex.acquire_fence_fd;
+    ex.acquire_fence_fd = -1;
     const uint32_t event_seq = (poll_id > 0) ? static_cast<uint32_t>(poll_id) : 0;
-    queue_prepared_present(drv_display_id, j, event_seq);
+    queue_prepared_present(drv_display_id, std::move(j), event_seq);
 }
 
 void destroy_buff(const std::array<uint8_t, 32>& data, int poll_id)

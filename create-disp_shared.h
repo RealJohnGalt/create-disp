@@ -262,6 +262,7 @@ struct PresentJob {
     uint32_t slot = 0;
     uint64_t generation = 0;
     SharedRwb rwb;
+    int acquire_fence_fd = -1;
 };
 
 struct PreparedPresent {
@@ -331,9 +332,13 @@ bool should_request_reopen(int err);
 void clear_pending_work_atomic(int drv_display_id);
 void publish_update_work(int drv_display_id, uint8_t work_bits);
 void schedule_update(int drv_display_id);
+void close_acquire_fence_fd(int& fd);
+void reset_present_job(PresentJob& job);
+void move_present_job(PresentJob& dst, PresentJob& src);
 void clear_present_state(int drv_display_id);
 void clear_prepared_present_locked(PreparedPresent& p);
-void queue_prepared_present(int drv_display_id, const PresentJob& job, uint32_t event_seq);
+void move_prepared_present(PreparedPresent& dst, PreparedPresent& src);
+void queue_prepared_present(int drv_display_id, PresentJob&& job, uint32_t event_seq);
 void clear_present_state_locked(int drv_display_id);
 void schedule_disconnect(int drv_display_id);
 bool take_next_update_display(int& out_drv_display_id);
