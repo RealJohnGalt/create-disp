@@ -576,6 +576,11 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
 
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
+
+    std::fprintf(stderr,
+                 "acquire_fence: swap_to_buff poll_id=%d buf_id=%d display=%d fd=%d\n",
+                 poll_id, id, drv_display_id, ex.acquire_fence_fd);
+
     if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
         std::fprintf(stderr,
                      "swap_to_buff: invalid display_id=%d for buf_id=%d (poll_id=%d)\n",
@@ -614,6 +619,10 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
 
     j.acquire_fence_fd = ex.acquire_fence_fd;
     ex.acquire_fence_fd = -1;
+    std::fprintf(stderr,
+                 "acquire_fence: prepared job poll_id=%d buf_id=%d display=%d slot=%u gen=%" PRIu64 " fd=%d\n",
+                 poll_id, j.buf_id, j.drv_display_id, j.slot, j.generation,
+                 j.acquire_fence_fd);
     const uint32_t event_seq = (poll_id > 0) ? static_cast<uint32_t>(poll_id) : 0;
     queue_prepared_present(drv_display_id, std::move(j), event_seq);
 }
