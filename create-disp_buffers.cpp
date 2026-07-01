@@ -77,6 +77,7 @@ void SlotManager::release(int bufid)
 
 BufferEntry::~BufferEntry()
 {
+    release_shadow_buffers(this);
     rwb = {};
     if (!handle) {
         return;
@@ -92,6 +93,94 @@ BufferEntry::~BufferEntry()
     }
 
     handle = nullptr;
+}
+
+void release_shadow_buffers(BufferEntry* entry)
+{
+    if (!entry) {
+        return;
+    }
+
+    for (int i = 0; i < kShadowBufferCount; i++) {
+        entry->shadow_rwbs[i] = {};
+        if (entry->shadow_handles[i]) {
+            hybris_gralloc_release(entry->shadow_handles[i], 1);
+            entry->shadow_handles[i] = nullptr;
+        }
+    }
+
+    entry->shadow_width = 0;
+    entry->shadow_height = 0;
+    entry->shadow_stride = 0;
+    entry->shadow_format = 0;
+    entry->shadow_head = 0;
+}
+
+bool allocate_shadow_buffers(BufferEntry* entry, int w, int h, uint32_t stride, int format)
+{
+    for (int i = 0; i < kShadowBufferCount; i++) {
+        buffer_handle_t hnd = nullptr;
+        uint32_t s = 0;
+
+        if (hybris_gralloc_allocate(w, h, format, kShadowUsage, &hnd, &s) != 0) {
+            release_shadow_buffers(entry);
+            return false;
+        }
+
+        entry->shadow_handles[i] = hnd;
+        entry->shadow_rwbs[i] = make_rwb(w, h, s, format, kShadowUsage, hnd);
+
+        if (!entry->shadow_rwbs[i]) {
+            release_shadow_buffers(entry);
+            return false;
+        }
+    }
+
+    entry->shadow_width = w;
+    entry->shadow_height = h;
+    entry->shadow_stride = stride;
+    entry->shadow_format = format;
+    return true;
+}
+
+bool shadow_copy_to_current(BufferEntry* entry, int w, int h, uint32_t stride)
+{
+    const int idx = entry->shadow_head;
+
+    void* src_vaddr = nullptr;
+    if (hybris_gralloc_lock(entry->handle, GRALLOC_USAGE_SW_READ_OFTEN,
+                            0, 0, 0, 0, &src_vaddr) != 0) {
+        return false;
+    }
+
+    void* dst_vaddr = nullptr;
+    if (hybris_gralloc_lock(entry->shadow_handles[idx], GRALLOC_USAGE_SW_WRITE_OFTEN,
+                            0, 0, 0, 0, &dst_vaddr) != 0) {
+        hybris_gralloc_unlock(entry->handle);
+        return false;
+    }
+
+    const uint32_t src_bstride = stride * 4;
+    const uint32_t dst_bstride = entry->shadow_stride * 4;
+    const int copy_w = std::min(w, entry->shadow_width);
+    const int copy_h = std::min(h, entry->shadow_height);
+    const int row_bytes = copy_w * 4;
+
+    if (src_bstride == dst_bstride && dst_bstride == static_cast<uint32_t>(row_bytes)) {
+        std::memcpy(dst_vaddr, src_vaddr, static_cast<size_t>(row_bytes) * copy_h);
+    } else {
+        for (int r = 0; r < copy_h; r++) {
+            std::memcpy(static_cast<char*>(dst_vaddr) + r * dst_bstride,
+                        static_cast<char*>(src_vaddr) + r * src_bstride,
+                        static_cast<size_t>(row_bytes));
+        }
+    }
+
+    hybris_gralloc_unlock(entry->shadow_handles[idx]);
+    hybris_gralloc_unlock(entry->handle);
+
+    entry->shadow_head = (idx + 1) % kShadowBufferCount;
+    return true;
 }
 
 SharedRwb make_rwb(int w, int h, uint32_t stride, int format, int usage, buffer_handle_t handle)
@@ -595,6 +684,37 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
             return;
         }
         break;
+    }
+
+    {
+        int sw = entry->width;
+        int sh = entry->height;
+        if (sw <= 0 || sh <= 0) {
+            DisplayRuntimeSnapshot s = snapshot_display_runtime_atomic(drv_display_id);
+            sw = s.width;
+            sh = s.height;
+        }
+
+        if (sw > 0 && sh > 0 && entry->stride > 0) {
+            if (entry->shadow_width != sw ||
+                entry->shadow_height != sh ||
+                entry->shadow_stride != entry->stride ||
+                entry->shadow_format != entry->format) {
+                release_shadow_buffers(entry.get());
+            }
+
+            if (!entry->shadow_handles[0] &&
+                !allocate_shadow_buffers(entry.get(), sw, sh,
+                                         entry->stride, entry->format)) {
+                fprintf(stderr, "swap_to_buff: failed to alloc shadows for buf %d\n", id);
+            }
+
+            if (entry->shadow_handles[0] &&
+                shadow_copy_to_current(entry.get(), sw, sh, entry->stride)) {
+                int idx = (entry->shadow_head - 1 + kShadowBufferCount) % kShadowBufferCount;
+                j.rwb = entry->shadow_rwbs[idx];
+            }
+        }
     }
 
     do_present(j);

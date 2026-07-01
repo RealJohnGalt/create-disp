@@ -155,10 +155,20 @@ struct RwbDeleter {
 using SharedRwb = std::shared_ptr<RemoteWindowBuffer>;
 
 constexpr int kMaxDriverDisplays = 5;
+constexpr int kShadowBufferCount = 3;
+
 constexpr int kRwbUsage =
     GRALLOC_USAGE_HW_TEXTURE |
     GRALLOC_USAGE_HW_RENDER |
-    GRALLOC_USAGE_HW_COMPOSER;
+    GRALLOC_USAGE_HW_COMPOSER |
+    GRALLOC_USAGE_SW_READ_OFTEN;
+
+constexpr int kShadowUsage =
+    GRALLOC_USAGE_HW_TEXTURE |
+    GRALLOC_USAGE_HW_RENDER |
+    GRALLOC_USAGE_HW_COMPOSER |
+    GRALLOC_USAGE_SW_READ_OFTEN |
+    GRALLOC_USAGE_SW_WRITE_OFTEN;
 constexpr size_t kExpectedHandles = 4096;
 constexpr int kShutdownKickSignal = SIGUSR1;
 constexpr uint8_t kUpdateWorkNone = 0;
@@ -244,6 +254,14 @@ struct BufferEntry {
     std::atomic<int> bound_display_id{-1};
     std::atomic<uint64_t> bound_generation{0};
     std::atomic<uint32_t> bound_slot{UINT32_MAX};
+
+    std::array<buffer_handle_t, kShadowBufferCount> shadow_handles{};
+    std::array<SharedRwb, kShadowBufferCount> shadow_rwbs{};
+    int shadow_width = 0;
+    int shadow_height = 0;
+    uint32_t shadow_stride = 0;
+    int shadow_format = 0;
+    int shadow_head = 0;
 
     ~BufferEntry();
 };
@@ -360,6 +378,10 @@ void get_entry_buffer_geometry(const std::shared_ptr<BufferEntry>& entry, const 
 bool entry_rwb_matches_atomic(const std::shared_ptr<BufferEntry>& entry, int buf_w, int buf_h, uint32_t buf_stride, int buf_format, SharedRwb& out_rwb);
 PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out);
 bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out);
+
+void release_shadow_buffers(BufferEntry* entry);
+bool allocate_shadow_buffers(BufferEntry* entry, int w, int h, uint32_t stride, int format);
+bool shadow_copy_to_current(BufferEntry* entry, int w, int h, uint32_t stride);
 
 bool do_present(PresentJob& j);
 
